@@ -1,0 +1,21 @@
+services:
+  database:
+    image: 'postgres:15.2'
+    ports:
+      - '5432:5432'
+    environment:
+      - 'POSTGRES_USER=paula'
+      - 'POSTGRES_DB=pauladb'
+      - 'POSTGRES_PASSWORD=paulaIstToll'
+
+  libretranslate:
+    image: libretranslate/libretranslate
+    container_name: libretranslate
+    restart: unless-stopped
+    ports:
+      - '5001:5000'
+    volumes:
+      - lt-local:/home/libretranslate/.local
+
+volumes:
+  lt-local:
