@@ -62,6 +62,13 @@ class NfcPublicController(
     fun games(@RequestAttribute(name = "authenticatedUser", required = false) user: AuthenticatedUser?) =
         publicQueryService.listGames(user?.id)
 
+    @GetMapping("/games/public")
+    fun publicGames() = publicQueryService.listPublicGames()
+
+    @PostMapping("/games/{gameId}/library")
+    fun addPublicGameToLibrary(@PathVariable gameId: UUID) =
+        publicQueryService.addPublicGameToLibrary(gameId)
+
     @GetMapping("/games/{gameId}/image")
     fun gameImage(
         @PathVariable gameId: UUID,

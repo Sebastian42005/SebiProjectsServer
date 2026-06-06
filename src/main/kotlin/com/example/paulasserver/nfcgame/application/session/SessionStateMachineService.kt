@@ -21,6 +21,7 @@ import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionAccount
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionRound
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionTeam
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionTeamMember
+import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionValue
 import com.example.paulasserver.nfcgame.persistence.repository.NfcCardRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcFlowEdgeRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcFlowNodeRepository
@@ -33,6 +34,7 @@ import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionAccount
 import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionRoundRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionTeamMemberRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionTeamRepository
+import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionValueRepository
 import com.fasterxml.jackson.core.type.TypeReference
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.springframework.http.HttpStatus
@@ -40,6 +42,7 @@ import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import org.springframework.web.server.ResponseStatusException
 import java.math.BigDecimal
+import java.math.MathContext
 import java.time.Instant
 import java.util.UUID
 
@@ -85,6 +88,7 @@ class SessionStateMachineService(
     private val memberRepository: NfcSessionTeamMemberRepository,
     private val roundRepository: NfcSessionRoundRepository,
     private val accountRepository: NfcSessionAccountRepository,
+    private val valueRepository: NfcSessionValueRepository,
     private val moneyTransactionRepository: NfcMoneyTransactionRepository,
     private val resultRepository: NfcGameResultRepository,
     private val statisticsService: NfcStatisticsService,
@@ -336,8 +340,8 @@ class SessionStateMachineService(
                 accountId = device.accountId
                 status = SessionStatus.BUILDING_TEAMS
                 currentStateKey = TEAM_SIZE_STATE
-                roundLimitType = if (template.supportsRoundLimit) RoundLimitType.ROUNDS else RoundLimitType.NONE
-                roundLimit = if (template.supportsRoundLimit) 3 else null
+                roundLimitType = RoundLimitType.NONE
+                roundLimit = null
             },
         )
         val sessionId = requireNotNull(session.id)
@@ -366,7 +370,22 @@ class SessionStateMachineService(
                 ownerType = OwnerType.BANK
                 balance = startCapital
             }
-            accountRepository.saveAll(accounts)
+            val savedAccounts = accountRepository.saveAll(accounts)
+            valueRepository.saveAll(
+                savedAccounts.mapNotNull { account ->
+                    val ownerId = when (account.ownerType) {
+                        OwnerType.TEAM -> account.teamId
+                        OwnerType.BANK -> account.id
+                    } ?: return@mapNotNull null
+                    NfcSessionValue().apply {
+                        this.sessionId = sessionId
+                        ownerType = account.ownerType
+                        this.ownerId = ownerId
+                        valueKey = "money"
+                        value = startCapital
+                    }
+                },
+            )
         }
 
         return session
@@ -429,7 +448,8 @@ class SessionStateMachineService(
         }
         sessionRepository.save(session)
 
-        return StateMachineResult(session = session, screen = buildScreen(session), effects = listOf("BEEP_SUCCESS"))
+        val freshSession = reloadSession(session)
+        return StateMachineResult(session = freshSession, screen = buildScreen(freshSession), effects = listOf("BEEP_SUCCESS"))
     }
 
     private fun recordWinFromPlayerCard(session: NfcGameSession, playerId: UUID): StateMachineResult {
@@ -449,7 +469,7 @@ class SessionStateMachineService(
 
         recordRoundWin(session, winningTeamId, 1)
         return if (roundLimitReached(session)) {
-            finishSession(session, calculateWinnerByRounds(session, teams), "ROUND_LIMIT_REACHED", teams.mapNotNull { it.id })
+            finishSession(session, calculateConfiguredWinner(session, teams), "ROUND_LIMIT_REACHED", teams.mapNotNull { it.id })
             StateMachineResult(session = session, screen = buildScreen(session), effects = listOf("BEEP_WIN"))
         } else {
             sessionRepository.save(session)
@@ -511,27 +531,15 @@ class SessionStateMachineService(
             when (node.type) {
                 "AWARD_POINTS", "AWARD_ROUND_WIN" -> {
                     if (!roundRecorded) {
-                        val points = intConfig(readMap(node.configJson), "points") ?: 1
-                        recordRoundWin(session, winningTeamId ?: scannedWinningTeamId, points)
+                        val resultContext = applyPointsNode(session, node, readMap(node.configJson), runtimeContext)
                         roundRecorded = true
-                        runtimeContext = runtimeContext + mapOf(
-                            "amount" to points.toString(),
-                            "targetLabel" to teamLabel(winningTeamId ?: scannedWinningTeamId),
-                            "lastAwardedTeam" to (winningTeamId ?: scannedWinningTeamId).toString(),
-                            "lastAwardedPoints" to points.toString(),
-                        )
+                        runtimeContext = runtimeContext + resultContext
                     }
                     nodeId = nextNodeByEventPreferringType(node, "NEXT", "LOG_EVENT")
                 }
 
                 "IF_ELSE", "CONDITION", "BRANCH" -> {
-                    nodeId = nextNodeByEvent(node, if (evaluateRuntimeCondition(session, node, emptyMap())) "TRUE" else "FALSE")
-                }
-
-                "CALCULATE_WINNER" -> {
-                    winningTeamId = calculateWinnerByRounds(session, teams)
-                    runtimeContext = runtimeContext + mapOf("winner" to (winningTeamId?.toString() ?: ""))
-                    nodeId = nextNodeByEvent(node, "NEXT")
+                    nodeId = nextNodeByEvent(node, if (evaluateRuntimeCondition(session, node, runtimeContext)) "TRUE" else "FALSE")
                 }
 
                 "LOG_EVENT" -> {
@@ -539,8 +547,13 @@ class SessionStateMachineService(
                     nodeId = nextNodeByEvent(node, "NEXT")
                 }
 
+                "CALCULATE" -> {
+                    runtimeContext = runtimeContext + calculateFlowValue(session, node, readMap(node.configJson), runtimeContext)
+                    nodeId = nextNodeByEvent(node, "NEXT")
+                }
+
                 "END_GAME" -> {
-                    finishSession(session, winningTeamId, "FLOW_ENDED", teams.mapNotNull { it.id })
+                    finishSession(session, calculateConfiguredWinner(session, teams), "FLOW_ENDED", teams.mapNotNull { it.id })
                     return StateMachineResult(session = session, screen = buildScreen(session), effects = listOf("BEEP_WIN"), timelineMessage = timelineMessage)
                 }
 
@@ -563,7 +576,7 @@ class SessionStateMachineService(
         winningTeamId: UUID?,
         timelineMessage: String? = null,
     ): StateMachineResult {
-        val calculatedWinner = calculateWinnerByRounds(session, teams)
+        val calculatedWinner = calculateConfiguredWinner(session, teams)
         val winnerForResult = if (calculatedWinner != null || hasRecordedRounds(session)) calculatedWinner else winningTeamId
         finishSession(session, winnerForResult, "FLOW_ENDED", teams.mapNotNull { it.id })
         return StateMachineResult(session = session, screen = buildScreen(session), effects = listOf("BEEP_WIN"), timelineMessage = timelineMessage)
@@ -580,41 +593,296 @@ class SessionStateMachineService(
                 awardedPointsPerMember = points
             },
         )
-        statisticsService.recordRoundWin(winningTeamId)
+        statisticsService.recordRoundWin(winningTeamId, points.toLong())
         session.currentRoundNumber = nextRound
     }
 
     private fun recordSessionPoints(session: NfcGameSession, teamId: UUID, points: Int) {
-        val sessionId = requireNotNull(session.id)
-        val nextRound = session.currentRoundNumber + 1
-        roundRepository.save(
-            NfcSessionRound().apply {
-                this.sessionId = sessionId
-                roundNumber = nextRound
-                winningTeamId = teamId
-                awardedPointsPerMember = points
-            },
-        )
-        session.currentRoundNumber = nextRound
+        recordSessionPoints(session, listOf(teamId), points)
     }
 
-    private fun pointsForNode(config: Map<String, Any?>, context: Map<String, String>): Int {
+    private fun recordSessionPoints(session: NfcGameSession, teamIds: Collection<UUID>, points: Int, advanceRound: Boolean = true) {
+        recordSessionPointDeltas(
+            session,
+            teamIds.associateWith { BigDecimal.valueOf(points.toLong()) },
+            advanceRound,
+        )
+    }
+
+    private fun recordSessionPointDeltas(session: NfcGameSession, deltasByTeam: Map<UUID, BigDecimal>, advanceRound: Boolean = true) {
+        val currentRound = effectiveCurrentRoundNumber(session)
+        val nonZeroDeltas = deltasByTeam
+            .mapValues { it.value.toInt() }
+            .filterValues { it != 0 }
+        if (nonZeroDeltas.isEmpty()) return
+        val sessionId = requireNotNull(session.id)
+        val roundNumber = if (advanceRound) currentRound + 1 else currentRound
+        roundRepository.saveAll(
+            nonZeroDeltas.map { (teamId, points) ->
+                NfcSessionRound().apply {
+                    this.sessionId = sessionId
+                    this.roundNumber = roundNumber
+                    winningTeamId = teamId
+                    awardedPointsPerMember = points
+                }
+            },
+        )
+        if (advanceRound) {
+            session.currentRoundNumber = roundNumber
+        }
+    }
+
+    private fun setSessionPoints(session: NfcGameSession, teamIds: Collection<UUID>, points: Int) {
+        val deltasByTeam = teamIds.associateWith { teamId -> points - sessionPointsForTeam(session, teamId) }
+            .filterValues { it != 0 }
+        if (deltasByTeam.isEmpty()) return
+        val sessionId = requireNotNull(session.id)
+        roundRepository.saveAll(
+            deltasByTeam.map { (teamId, delta) ->
+                NfcSessionRound().apply {
+                    this.sessionId = sessionId
+                    roundNumber = session.currentRoundNumber
+                    winningTeamId = teamId
+                    awardedPointsPerMember = delta
+                }
+            },
+        )
+    }
+
+    private fun pointsForNode(session: NfcGameSession, config: Map<String, Any?>, context: Map<String, String>): Int {
         val pointsFrom = config["pointsFrom"]?.toString()?.takeIf { it.isNotBlank() }
             ?: config["valueFrom"]?.toString()?.takeIf { it.isNotBlank() }
-        return pointsFrom?.let { context[it]?.toIntOrNull() }
+        return pointsFrom?.let { numericValueForExpression(session, it, context)?.toInt() }
             ?: intConfig(config, "points")
             ?: 1
     }
+
+    private fun numericValueForExpression(session: NfcGameSession, expression: String, context: Map<String, String>): BigDecimal? =
+        ArithmeticExpressionParser(expression) { token -> numericValueForToken(session, token, context) }.parse()
+
+    private fun numericValueForToken(session: NfcGameSession, token: String, context: Map<String, String>): BigDecimal? {
+        val key = token.trim().removePrefix("{").removeSuffix("}")
+        context[key]?.toBigDecimalOrNull()?.let { return it }
+        when (key) {
+            "currentRound", "round", "currentRoundNumber" -> return effectiveCurrentRoundNumber(session).toBigDecimal()
+            "roundLimit" -> return session.roundLimit?.toBigDecimal()
+        }
+        val parts = key.split('.', limit = 2)
+        if (parts.size != 2) return key.toBigDecimalOrNull()
+        val owner = parts[0]
+        val keyName = normalizeValueKey(parts[1])
+        return when (keyName) {
+            "rounds", "wins" -> teamIdForBuilderReference(session, owner, context)
+                ?.let { roundWinsForTeam(session, it).toBigDecimal() }
+            else -> valueForBuilderReference(session, owner, keyName, context)
+        }
+    }
+
+    private fun calculateFlowValue(session: NfcGameSession, node: NfcFlowNode, config: Map<String, Any?>, context: Map<String, String>): Map<String, String> {
+        val target = config["targetVariable"]?.toString()?.takeIf { it.isNotBlank() && it != "custom" }
+            ?: config["variableName"]?.toString()?.takeIf { it.isNotBlank() }
+            ?: config["storeAs"]?.toString()?.takeIf { it.isNotBlank() }
+            ?: return emptyMap()
+        val expression = config["expression"]?.toString()?.takeIf { it.isNotBlank() }
+            ?: config["formula"]?.toString()?.takeIf { it.isNotBlank() }
+            ?: return emptyMap()
+        val value = numericValueForExpression(session, expression, context) ?: return emptyMap()
+        return mapOf(target.trim().removePrefix("{").removeSuffix("}") to value.stripTrailingZeros().toPlainString())
+    }
+
+    private fun displayValueForExpression(session: NfcGameSession, expression: String, context: Map<String, String>): String? {
+        val key = expression.trim().removePrefix("{").removeSuffix("}")
+        val parts = key.split('.', limit = 2)
+        if (parts.size != 2) {
+            return context[key]?.let { displayValueForVariable(session, key, it) }
+                ?: numericValueForExpression(session, key, context)?.stripTrailingZeros()?.toPlainString()
+        }
+        val owner = parts[0]
+        return when (parts[1].lowercase()) {
+            "name" -> playerIdForBuilderReference(owner, context)?.let { playerName(it.toString()) }
+                ?: accountForBuilderReference(session, owner, context)
+                ?.let { accountLabel(session, requireNotNull(it.id).toString()) }
+                ?: teamIdForBuilderReference(session, owner, context)?.let { teamLabel(it) }
+            "team", "teamname" -> teamIdForBuilderReference(session, owner, context)?.let { teamLabel(it) }
+            "points", "score", "rounds", "wins", "money", "balance" -> numericValueForExpression(session, key, context)
+                ?.stripTrailingZeros()
+                ?.toPlainString()
+            else -> null
+        }
+    }
+
+    private fun playerIdForBuilderReference(reference: String, context: Map<String, String>): UUID? {
+        val value = context[reference]
+            ?: when (reference) {
+                "player", "scannedPlayer", "lastScannedPlayer" -> context["player"] ?: context["scannedPlayer"] ?: context["lastScannedPlayer"]
+                else -> null
+            }
+        return value?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+    }
+
+    private fun teamIdForBuilderReference(session: NfcGameSession, reference: String, context: Map<String, String>): UUID? {
+        context["${reference}Team"]?.let { value -> runCatching { UUID.fromString(value) }.getOrNull()?.let { return it } }
+        val directTeamValue = context[reference]?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+        if (reference in setOf("team", "scannedTeam", "lastScannedTeam", "lastAwardedTeam", "winner")) {
+            directTeamValue?.let { return it }
+        }
+        if (reference == "selectedTarget" || reference == "selectedAccount" || reference == "target") {
+            accountForBuilderReference(session, reference, context)?.teamId?.let { return it }
+        }
+        val playerId = playerIdForBuilderReference(reference, context) ?: return null
+        val teams = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
+        return memberRepository.findByPlayerIdAndSessionTeamIdIn(playerId, teams.mapNotNull { it.id })?.sessionTeamId
+    }
+
+    private fun accountForBuilderReference(session: NfcGameSession, reference: String, context: Map<String, String>): NfcSessionAccount? {
+        val sessionId = requireNotNull(session.id)
+        val accountIdValue = when (reference) {
+            "selectedTarget", "selectedAccount", "target" -> context["targetAccountId"] ?: context["target"]
+            "payer", "payerAccount" -> context["payerAccountId"]
+            else -> context[reference]
+        }
+        accountIdValue
+            ?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+            ?.let { accountId ->
+                accountRepository.findById(accountId).orElse(null)
+                    ?.takeIf { it.sessionId == session.id }
+                    ?.let { return it }
+            }
+        val teamId = teamIdForBuilderReferenceWithoutAccountLookup(session, reference, context) ?: return null
+        return accountRepository.findAllBySessionId(sessionId).firstOrNull { it.ownerType == OwnerType.TEAM && it.teamId == teamId }
+    }
+
+    private data class ValueOwner(val ownerType: OwnerType, val ownerId: UUID)
+
+    private fun valueOwnerForBuilderReference(session: NfcGameSession, reference: String, context: Map<String, String>): ValueOwner? {
+        accountForBuilderReference(session, reference, context)?.let { account ->
+            return when (account.ownerType) {
+                OwnerType.BANK -> ValueOwner(OwnerType.BANK, requireNotNull(account.id))
+                OwnerType.TEAM -> account.teamId?.let { ValueOwner(OwnerType.TEAM, it) }
+            }
+        }
+        return teamIdForBuilderReferenceWithoutAccountLookup(session, reference, context)?.let { ValueOwner(OwnerType.TEAM, it) }
+    }
+
+    private fun valueForBuilderReference(session: NfcGameSession, reference: String, valueKey: String, context: Map<String, String>): BigDecimal? {
+        val owner = valueOwnerForBuilderReference(session, reference, context) ?: return null
+        return sessionValue(session, owner.ownerType, owner.ownerId, valueKey)
+            ?: legacyValueForBuilderReference(session, reference, valueKey, context)
+            ?: BigDecimal.ZERO
+    }
+
+    private fun sessionValue(session: NfcGameSession, ownerType: OwnerType, ownerId: UUID, valueKey: String): BigDecimal? =
+        valueRepository.findBySessionIdAndOwnerTypeAndOwnerIdAndValueKey(requireNotNull(session.id), ownerType, ownerId, normalizeValueKey(valueKey))?.value
+
+    private fun changeSessionValue(
+        session: NfcGameSession,
+        ownerType: OwnerType,
+        ownerId: UUID,
+        valueKey: String,
+        amount: BigDecimal,
+        operation: String,
+    ): BigDecimal {
+        val sessionId = requireNotNull(session.id)
+        val normalizedKey = normalizeValueKey(valueKey)
+        val entity = valueRepository.findBySessionIdAndOwnerTypeAndOwnerIdAndValueKey(sessionId, ownerType, ownerId, normalizedKey)
+            ?: NfcSessionValue().apply {
+                this.sessionId = sessionId
+                this.ownerType = ownerType
+                this.ownerId = ownerId
+                this.valueKey = normalizedKey
+                value = legacyValueForOwner(session, ownerType, ownerId, normalizedKey) ?: BigDecimal.ZERO
+            }
+        entity.value = when (operation.uppercase()) {
+            "SET" -> amount
+            "SUBTRACT", "SUB", "DEDUCT" -> entity.value.subtract(amount)
+            else -> entity.value.add(amount)
+        }
+        valueRepository.save(entity)
+        syncLegacyMoneyValue(session, ownerType, ownerId, normalizedKey, entity.value)
+        return entity.value
+    }
+
+    private fun legacyValueForBuilderReference(session: NfcGameSession, reference: String, valueKey: String, context: Map<String, String>): BigDecimal? =
+        when (normalizeValueKey(valueKey)) {
+            "points" -> teamIdForBuilderReference(session, reference, context)?.let { sessionPointsForTeam(session, it).toBigDecimal() }
+            "rounds", "wins", "roundwins" -> teamIdForBuilderReference(session, reference, context)?.let { roundWinsForTeam(session, it).toBigDecimal() }
+            "money" -> accountForBuilderReference(session, reference, context)?.balance
+            else -> null
+        }
+
+    private fun legacyValueForOwner(session: NfcGameSession, ownerType: OwnerType, ownerId: UUID, valueKey: String): BigDecimal? =
+        when (normalizeValueKey(valueKey)) {
+            "points" -> if (ownerType == OwnerType.TEAM) sessionPointsForTeam(session, ownerId).toBigDecimal() else null
+            "rounds", "wins", "roundwins" -> if (ownerType == OwnerType.TEAM) roundWinsForTeam(session, ownerId).toBigDecimal() else null
+            "money" -> accountRepository.findAllBySessionId(requireNotNull(session.id))
+                .firstOrNull { account ->
+                    when (ownerType) {
+                        OwnerType.BANK -> account.ownerType == OwnerType.BANK && account.id == ownerId
+                        OwnerType.TEAM -> account.ownerType == OwnerType.TEAM && account.teamId == ownerId
+                    }
+                }
+                ?.balance
+            else -> null
+        }
+
+    private fun syncLegacyMoneyValue(session: NfcGameSession, ownerType: OwnerType, ownerId: UUID, valueKey: String, value: BigDecimal) {
+        if (normalizeValueKey(valueKey) != "money") return
+        val account = accountRepository.findAllBySessionId(requireNotNull(session.id))
+            .firstOrNull { account ->
+                when (ownerType) {
+                    OwnerType.BANK -> account.ownerType == OwnerType.BANK && account.id == ownerId
+                    OwnerType.TEAM -> account.ownerType == OwnerType.TEAM && account.teamId == ownerId
+                }
+            } ?: return
+        account.balance = value
+        accountRepository.save(account)
+    }
+
+    private fun normalizeValueKey(valueKey: String): String =
+        when (valueKey.trim().removePrefix("{").removeSuffix("}").lowercase()) {
+            "score", "punkt", "punkte" -> "points"
+            "balance", "kontostand", "geld" -> "money"
+            else -> valueKey.trim().removePrefix("{").removeSuffix("}").lowercase()
+        }
+
+    private fun teamIdForBuilderReferenceWithoutAccountLookup(session: NfcGameSession, reference: String, context: Map<String, String>): UUID? {
+        context["${reference}Team"]?.let { value -> runCatching { UUID.fromString(value) }.getOrNull()?.let { return it } }
+        val directTeamValue = context[reference]?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+        if (reference in setOf("team", "scannedTeam", "lastScannedTeam", "lastAwardedTeam", "winner")) {
+            directTeamValue?.let { return it }
+        }
+        val playerId = playerIdForBuilderReference(reference, context) ?: return null
+        val teams = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
+        return memberRepository.findByPlayerIdAndSessionTeamIdIn(playerId, teams.mapNotNull { it.id })?.sessionTeamId
+    }
+
+    private fun sessionPointsForTeam(session: NfcGameSession, teamId: UUID): Int =
+        roundRepository.findAllBySessionIdOrderByRoundNumberAsc(requireNotNull(session.id))
+            .filter { it.winningTeamId == teamId }
+            .sumOf { it.awardedPointsPerMember }
+
+    private fun roundWinsForTeam(session: NfcGameSession, teamId: UUID): Int =
+        roundRepository.findAllBySessionIdOrderByRoundNumberAsc(requireNotNull(session.id))
+            .count { it.winningTeamId == teamId }
 
     private fun targetTeamForPoints(
         session: NfcGameSession,
         config: Map<String, Any?>,
         context: Map<String, String>,
     ): UUID? {
-        val target = config["targetVariable"]?.toString()?.takeIf { it.isNotBlank() }
-            ?: config["target"]?.toString()?.takeIf { it.isNotBlank() }
+        val target = (config["targetVariable"]?.toString()?.takeIf { it.isNotBlank() }
+            ?: config["target"]?.toString()?.takeIf { it.isNotBlank() })
+            ?.trim()
+            ?.removePrefix("{")
+            ?.removeSuffix("}")
             ?: "team"
         context["${target}Team"]?.let { return runCatching { UUID.fromString(it) }.getOrNull() }
+        if (target.contains('.')) {
+            return teamIdForBuilderReference(session, target.substringBefore('.'), context)
+        }
+        if (target in setOf("selectedTarget", "selectedAccount", "target")) {
+            return accountForBuilderReference(session, target, context)?.teamId
+        }
         if (target in setOf("lastScannedTeam", "scannedTeam", "team")) {
             return context["team"]?.let { runCatching { UUID.fromString(it) }.getOrNull() }
         }
@@ -625,6 +893,130 @@ class SessionStateMachineService(
         return memberRepository.findByPlayerIdAndSessionTeamIdIn(playerUuid, teams.mapNotNull { it.id })?.sessionTeamId
     }
 
+    private fun targetTeamsForPoints(
+        session: NfcGameSession,
+        config: Map<String, Any?>,
+        context: Map<String, String>,
+    ): List<UUID> {
+        val target = (config["targetVariable"]?.toString()?.takeIf { it.isNotBlank() }
+            ?: config["target"]?.toString()?.takeIf { it.isNotBlank() })
+            ?.trim()
+            ?.removePrefix("{")
+            ?.removeSuffix("}")
+            ?: "team"
+        if (target in setOf("allTeams", "allPlayers", "everyone")) {
+            return teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id)).mapNotNull { it.id }
+        }
+        return targetTeamForPoints(session, config, context)?.let(::listOf).orEmpty()
+    }
+
+    private fun targetValueOwners(
+        session: NfcGameSession,
+        config: Map<String, Any?>,
+        context: Map<String, String>,
+    ): List<ValueOwner> {
+        val target = (config["targetVariable"]?.toString()?.takeIf { it.isNotBlank() }
+            ?: config["target"]?.toString()?.takeIf { it.isNotBlank() })
+            ?.trim()
+            ?.removePrefix("{")
+            ?.removeSuffix("}")
+            ?: "team"
+        if (target in setOf("allTeams", "allPlayers", "everyone")) {
+            return teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
+                .mapNotNull { team -> team.id?.let { ValueOwner(OwnerType.TEAM, it) } }
+        }
+        return valueOwnerForBuilderReference(session, target.substringBefore('.'), context)?.let(::listOf).orEmpty()
+    }
+
+    private fun applyPointsNode(
+        session: NfcGameSession,
+        node: NfcFlowNode,
+        config: Map<String, Any?>,
+        context: Map<String, String>,
+    ): Map<String, String> {
+        val isGlobalValueNode = node.type == "AWARD_ROUND_WIN" || config["scope"]?.toString() == "GLOBAL_STATS"
+        val points = if (isGlobalValueNode) {
+            pointsForNode(session, config, context).coerceAtLeast(0)
+        } else {
+            pointsForNode(session, config, context)
+        }
+        val valueKey = if (isGlobalValueNode) {
+            "points"
+        } else {
+            normalizeValueKey(config["valueKey"]?.toString()?.takeIf { it.isNotBlank() } ?: "points")
+        }
+        val targetOwners = targetValueOwners(session, config, context)
+        if (targetOwners.isEmpty()) return emptyMap()
+        val expression = if (!isGlobalValueNode) {
+            config["expression"]?.toString()?.takeIf { it.isNotBlank() }
+                ?: config["formula"]?.toString()?.takeIf { it.isNotBlank() }
+        } else {
+            null
+        }
+        val operation = if (isGlobalValueNode) {
+            "ADD"
+        } else {
+            config["operation"]?.toString()?.uppercase().takeUnless { it.isNullOrBlank() } ?: "ADD"
+        }
+        val amount = BigDecimal.valueOf(points.toLong())
+        val valueDeltas = mutableMapOf<ValueOwner, BigDecimal>()
+        val values = if (isGlobalValueNode) {
+            targetOwners.associateWith { amount }
+        } else if (expression != null) {
+            targetOwners.mapNotNull { owner ->
+                val current = sessionValue(session, owner.ownerType, owner.ownerId, valueKey)
+                    ?: legacyValueForOwner(session, owner.ownerType, owner.ownerId, valueKey)
+                    ?: BigDecimal.ZERO
+                val calculated = numericValueForExpression(
+                    session,
+                    expression,
+                    context + mapOf("current" to current.stripTrailingZeros().toPlainString()),
+                ) ?: return@mapNotNull null
+                valueDeltas[owner] = calculated.subtract(current)
+                owner to changeSessionValue(session, owner.ownerType, owner.ownerId, valueKey, calculated, "SET")
+            }.toMap()
+        } else {
+            targetOwners.associateWith { owner ->
+                val current = sessionValue(session, owner.ownerType, owner.ownerId, valueKey)
+                    ?: legacyValueForOwner(session, owner.ownerType, owner.ownerId, valueKey)
+                    ?: BigDecimal.ZERO
+                val changed = changeSessionValue(session, owner.ownerType, owner.ownerId, valueKey, amount, operation)
+                valueDeltas[owner] = changed.subtract(current)
+                changed
+            }
+        }
+        if (isGlobalValueNode) {
+            targetOwners.filter { it.ownerType == OwnerType.TEAM }.forEach { recordRoundWin(session, it.ownerId, points) }
+        } else if (valueKey == "points" && config["advanceRound"] != false) {
+            recordSessionPointDeltas(
+                session,
+                valueDeltas
+                    .filterKeys { it.ownerType == OwnerType.TEAM }
+                    .mapKeys { it.key.ownerId },
+            )
+        }
+        val targetLabel = if (targetOwners.size == 1) labelForValueOwner(session, targetOwners.first()) else "Alle Teams"
+        val firstDelta = valueDeltas[targetOwners.first()] ?: amount
+        val displayedAmount = if (isGlobalValueNode) amount else firstDelta.abs()
+        return buildMap {
+            put("amount", displayedAmount.stripTrailingZeros().toPlainString())
+            put("lastAwardedPoints", displayedAmount.stripTrailingZeros().toPlainString())
+            put("lastDelta", firstDelta.stripTrailingZeros().toPlainString())
+            putAll(mapOf(
+            "valueKey" to valueKey,
+            "targetLabel" to targetLabel,
+            "lastAwardedTeam" to targetOwners.first().ownerId.toString(),
+            "lastValue" to (values[targetOwners.first()] ?: BigDecimal.ZERO).stripTrailingZeros().toPlainString(),
+            ))
+        }
+    }
+
+    private fun labelForValueOwner(session: NfcGameSession, owner: ValueOwner): String =
+        when (owner.ownerType) {
+            OwnerType.BANK -> "Bank"
+            OwnerType.TEAM -> teamLabel(owner.ownerId)
+        }
+
     private fun evaluateRuntimeCondition(
         session: NfcGameSession,
         node: NfcFlowNode,
@@ -632,8 +1024,11 @@ class SessionStateMachineService(
     ): Boolean {
         val expression = readMap(node.configJson)["expression"]?.toString().orEmpty()
         if (expression.contains("roundLimit", ignoreCase = true)) {
+            if (session.roundLimit == null && expression.contains("roundLimit == null", ignoreCase = true)) return true
+            evaluateNumericCondition(session, expression.substringAfter("||").trim(), context)?.let { return it }
             return !roundLimitReached(session)
         }
+        evaluateNumericCondition(session, expression, context)?.let { return it }
         if (expression.contains("balance", ignoreCase = true)) {
             val balance = conditionAccountBalance(session, expression, context) ?: return false
             val normalizedExpression = expression.replace("\\s+".toRegex(), "")
@@ -649,6 +1044,24 @@ class SessionStateMachineService(
             }
         }
         return false
+    }
+
+    private fun evaluateNumericCondition(session: NfcGameSession, expression: String, context: Map<String, String>): Boolean? {
+        val match = Regex("""^\s*([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?)\s*(<=|>=|==|!=|<|>)\s*(-?\d+(?:\.\d+)?|[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?)\s*$""")
+            .matchEntire(expression)
+            ?: return null
+        val left = numericValueForExpression(session, match.groupValues[1], context) ?: return false
+        val rightToken = match.groupValues[3]
+        val right = rightToken.toBigDecimalOrNull() ?: numericValueForExpression(session, rightToken, context) ?: return false
+        return when (match.groupValues[2]) {
+            "<=" -> left <= right
+            ">=" -> left >= right
+            "==" -> left.compareTo(right) == 0
+            "!=" -> left.compareTo(right) != 0
+            "<" -> left < right
+            ">" -> left > right
+            else -> false
+        }
     }
 
     private fun conditionAccountBalance(
@@ -677,7 +1090,15 @@ class SessionStateMachineService(
     private fun roundLimitReached(session: NfcGameSession): Boolean =
         session.roundLimitType == RoundLimitType.ROUNDS &&
             session.roundLimit != null &&
-            session.currentRoundNumber >= requireNotNull(session.roundLimit)
+            effectiveCurrentRoundNumber(session) >= requireNotNull(session.roundLimit)
+
+    private fun effectiveCurrentRoundNumber(session: NfcGameSession): Int {
+        val sessionId = requireNotNull(session.id)
+        val maxRecordedRound = roundRepository.findAllBySessionIdOrderByRoundNumberAsc(sessionId)
+            .maxOfOrNull { it.roundNumber }
+            ?: 0
+        return if (maxRecordedRound > 0) maxRecordedRound else session.currentRoundNumber
+    }
 
     private fun calculateWinnerByRounds(session: NfcGameSession, teams: List<NfcSessionTeam>): UUID? {
         val teamIds = teams.mapNotNull { it.id }.toSet()
@@ -692,47 +1113,24 @@ class SessionStateMachineService(
         return if (winners.size == 1) winners.first() else null
     }
 
-    private fun calculateWinnerBySessionPoints(session: NfcGameSession, teams: List<NfcSessionTeam>, lowest: Boolean): UUID? {
+    private fun calculateConfiguredWinner(session: NfcGameSession, teams: List<NfcSessionTeam>): UUID? {
+        val template = session.gameTemplateId
+            ?.let { gameTemplateRepository.findById(it).orElse(null) }
+        val valueKey = normalizeValueKey(template?.dashboardMetricSource?.takeIf { it.isNotBlank() } ?: "points")
+        val lowest = template?.dashboardMetricSortDirection?.equals("ASC", ignoreCase = true) == true
+        return calculateWinnerBySessionValue(session, teams, valueKey, lowest)
+    }
+
+    private fun calculateWinnerBySessionValue(session: NfcGameSession, teams: List<NfcSessionTeam>, valueKey: String, lowest: Boolean): UUID? {
         val teamIds = teams.mapNotNull { it.id }
         if (teamIds.isEmpty()) return null
-        val rounds = roundRepository.findAllBySessionIdOrderByRoundNumberAsc(requireNotNull(session.id))
-        val pointsByTeam = teamIds.associateWith { teamId ->
-            rounds
-                .filter { it.winningTeamId == teamId }
-                .sumOf { it.awardedPointsPerMember }
+        val valuesByTeam = teamIds.associateWith { teamId ->
+            sessionValue(session, OwnerType.TEAM, teamId, valueKey)
+                ?: legacyValueForOwner(session, OwnerType.TEAM, teamId, valueKey)
+                ?: BigDecimal.ZERO
         }
-        val bestScore = if (lowest) pointsByTeam.minOf { it.value } else pointsByTeam.maxOf { it.value }
-        val winners = pointsByTeam.filterValues { it == bestScore }.keys
-        return if (winners.size == 1) winners.first() else null
-    }
-
-    private fun calculateConfiguredWinner(session: NfcGameSession, teams: List<NfcSessionTeam>): UUID? {
-        val rule = session.gameTemplateId
-            ?.let { flowNodeRepository.findAllByGameTemplateIdOrderBySortOrderAsc(it) }
-            ?.firstOrNull { it.type == "CALCULATE_WINNER" }
-            ?.let { readMap(it.configJson)["rule"]?.toString() }
-            .orEmpty()
-        return calculateWinnerByRule(session, rule, teams)
-    }
-
-    private fun calculateWinnerByRule(
-        session: NfcGameSession,
-        rule: String,
-        teams: List<NfcSessionTeam> = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id)),
-    ): UUID? =
-        when {
-            rule.equals("HIGHEST_BALANCE", ignoreCase = true) || isEconomySession(session) -> calculateWinnerByBalance(session)
-            rule.equals("LOWEST_POINTS", ignoreCase = true) -> calculateWinnerBySessionPoints(session, teams, lowest = true)
-            rule.equals("MOST_POINTS", ignoreCase = true) -> calculateWinnerBySessionPoints(session, teams, lowest = false)
-            else -> calculateWinnerByRounds(session, teams)
-        }
-
-    private fun calculateWinnerByBalance(session: NfcGameSession): UUID? {
-        val accounts = accountRepository.findAllBySessionId(requireNotNull(session.id))
-            .filter { it.ownerType == OwnerType.TEAM && it.teamId != null }
-        if (accounts.isEmpty()) return null
-        val bestBalance = accounts.maxOf { it.balance }
-        val winners = accounts.filter { it.balance == bestBalance }.mapNotNull { it.teamId }.distinct()
+        val bestValue = if (lowest) valuesByTeam.minOf { it.value } else valuesByTeam.maxOf { it.value }
+        val winners = valuesByTeam.filterValues { it == bestValue }.keys
         return if (winners.size == 1) winners.first() else null
     }
 
@@ -766,13 +1164,17 @@ class SessionStateMachineService(
         val targetLabel = bankTargets(session).firstOrNull { it.accountId == targetAccount.id }?.label ?: "Empfaenger"
         val currency = bankStepConfig(session).currency
         val amount = BigDecimal.valueOf(state.amount.toLong())
-        if (payerAccount.balance < amount) {
+        val payerOwner = ValueOwner(OwnerType.TEAM, requireNotNull(payerAccount.teamId))
+        val targetOwner = when (targetAccount.ownerType) {
+            OwnerType.BANK -> ValueOwner(OwnerType.BANK, requireNotNull(targetAccount.id))
+            OwnerType.TEAM -> ValueOwner(OwnerType.TEAM, requireNotNull(targetAccount.teamId))
+        }
+        val payerBalance = sessionValue(session, payerOwner.ownerType, payerOwner.ownerId, "money") ?: payerAccount.balance
+        if (payerBalance < amount) {
             return StateMachineResult(session, buildScreen(session), effects = listOf("BEEP_ERROR"), errors = listOf("Nicht genug Guthaben."))
         }
-        payerAccount.balance = payerAccount.balance.subtract(amount)
-        targetAccount.balance = targetAccount.balance.add(amount)
-        accountRepository.save(payerAccount)
-        accountRepository.save(targetAccount)
+        changeSessionValue(session, payerOwner.ownerType, payerOwner.ownerId, "money", amount, "SUBTRACT")
+        changeSessionValue(session, targetOwner.ownerType, targetOwner.ownerId, "money", amount, "ADD")
         moneyTransactionRepository.save(
             NfcMoneyTransaction().apply {
                 sessionId = session.id
@@ -862,7 +1264,7 @@ class SessionStateMachineService(
                         screenType = ScreenType.WAITING_FOR_SCAN,
                         title = "Spiel laeuft",
                         subtitle = "Spielerkarte fuer Gewinn scannen",
-                        lines = listOf("Runde ${session.currentRoundNumber + 1}", "Spielkarte scannt = beenden"),
+                        lines = listOf("Runde ${effectiveCurrentRoundNumber(session) + 1}", "Spielkarte scannt = beenden"),
                         context = mapOf("sessionStatus" to session.status.name),
                     )
                 }
@@ -967,6 +1369,9 @@ class SessionStateMachineService(
     private fun buildFlowScreen(session: NfcGameSession): ScreenModel? {
         val node = currentFlowNode(session) ?: return null
         val config = readMap(node.configJson)
+        val context = flowContext(session)
+        val title = renderBuilderTemplate(session, node.title, context) ?: node.title
+        val text = renderBuilderTemplate(session, config["text"]?.toString(), context)
         return when (node.type) {
             "START" -> {
                 val next = nextNodeByEvent(node, "NEXT")
@@ -976,7 +1381,7 @@ class SessionStateMachineService(
                     sessionRepository.save(session)
                     buildFlowScreen(session)
                 } else {
-                    ScreenModel(ScreenType.MESSAGE, node.title, config["text"]?.toString(), context = mapOf("sessionStatus" to session.status.name))
+                    ScreenModel(ScreenType.MESSAGE, title, text, context = mapOf("sessionStatus" to session.status.name))
                 }
             }
 
@@ -984,8 +1389,8 @@ class SessionStateMachineService(
                 val items = menuItemsForNode(session, node)
                 ScreenModel(
                     screenType = ScreenType.MENU,
-                    title = node.title,
-                    subtitle = config["text"]?.toString(),
+                    title = title,
+                    subtitle = text,
                     menuItems = items,
                     selectedIndex = currentSelectedIndex(session, items.size),
                     context = mapOf("sessionStatus" to session.status.name, "nodeType" to node.type),
@@ -993,17 +1398,21 @@ class SessionStateMachineService(
             }
 
             "NUMBER_PICKER" -> {
+                val min = intConfig(config, "min") ?: 1
+                val max = intConfig(config, "max") ?: 99
                 val smallStep = intConfig(config, "smallStep") ?: intConfig(config, "step") ?: 1
                 val largeStep = intConfig(config, "largeStep") ?: smallStep
                 ScreenModel(
                     screenType = ScreenType.NUMBER_PICKER,
-                    title = node.title,
-                    subtitle = config["text"]?.toString(),
+                    title = title,
+                    subtitle = text,
                     lines = listOf("Touch: Wert setzen"),
                     numberValue = currentNumberValue(session, node),
                     context = mapOf(
                         "sessionStatus" to session.status.name,
                         "nodeType" to node.type,
+                        "min" to min,
+                        "max" to max,
                         "numberSmallStep" to smallStep,
                         "numberLargeStep" to largeStep,
                     ),
@@ -1012,16 +1421,20 @@ class SessionStateMachineService(
 
             "WAIT_PLAYER_CARD", "WAIT_ANY_CARD", "WAIT_GAME_CARD" -> ScreenModel(
                 screenType = ScreenType.WAITING_FOR_SCAN,
-                title = node.title,
-                subtitle = config["text"]?.toString(),
+                title = title,
+                subtitle = text,
                 context = mapOf("sessionStatus" to session.status.name, "nodeType" to node.type),
             )
 
             else -> ScreenModel(
                 screenType = ScreenType.MESSAGE,
-                title = node.title,
-                subtitle = config["text"]?.toString(),
-                context = mapOf("sessionStatus" to session.status.name, "nodeType" to node.type),
+                title = title,
+                subtitle = text,
+                context = mapOf(
+                    "sessionStatus" to session.status.name,
+                    "nodeType" to node.type,
+                    "continueMode" to (config["continueMode"]?.toString() ?: "AUTO"),
+                ),
             )
         }
     }
@@ -1125,7 +1538,10 @@ class SessionStateMachineService(
     private fun isEconomyTemplate(template: NfcGameTemplate): Boolean =
         template.economyEnabled ||
             flowNodeRepository.findAllByGameTemplateIdOrderBySortOrderAsc(requireNotNull(template.id)).any {
-                it.type in setOf("ENABLE_BANK", "MONEY_TRANSFER")
+                val config = readMap(it.configJson)
+                it.type in setOf("ENABLE_BANK", "MONEY_TRANSFER") ||
+                    normalizeValueKey(config["valueKey"]?.toString().orEmpty()) == "money" ||
+                    config.values.any { value -> value?.toString()?.contains(".money", ignoreCase = true) == true }
             }
 
     private fun economyStartCapital(template: NfcGameTemplate): BigDecimal {
@@ -1220,28 +1636,29 @@ class SessionStateMachineService(
             when (node.type) {
                 "AWARD_POINTS", "AWARD_ROUND_WIN" -> {
                     val config = readMap(node.configJson)
-                    val points = pointsForNode(config, runtimeContext)
-                    val targetTeamId = targetTeamForPoints(session, config, runtimeContext)
-                    if (targetTeamId != null) {
-                        if (node.type == "AWARD_ROUND_WIN" || config["scope"]?.toString() == "GLOBAL_STATS") {
-                            recordRoundWin(session, targetTeamId, points)
-                        } else {
-                            recordSessionPoints(session, targetTeamId, points)
-                        }
-                        runtimeContext = runtimeContext + mapOf(
-                            "amount" to points.toString(),
-                            "targetLabel" to teamLabel(targetTeamId),
-                            "lastAwardedTeam" to targetTeamId.toString(),
-                            "lastAwardedPoints" to points.toString(),
-                        )
-                    }
+                    runtimeContext = runtimeContext + applyPointsNode(session, node, config, runtimeContext)
                     nodeId = nextNodeByEventPreferringType(node, "NEXT", "LOG_EVENT")
                 }
 
-                "START", "ENABLE_BANK", "DASHBOARD_METRIC", "SHOW_MESSAGE" -> nodeId = nextNodeByEvent(node, "NEXT")
+                "START", "ENABLE_BANK", "DASHBOARD_METRIC" -> nodeId = nextNodeByEvent(node, "NEXT")
+
+                "SHOW_MESSAGE" -> {
+                    val continueMode = readMap(node.configJson)["continueMode"]?.toString()?.uppercase()
+                    if (continueMode == "BUTTON") {
+                        session.currentStateKey = flowStateKey(node, context = runtimeContext)
+                        sessionRepository.save(session)
+                        return StateMachineResult(session = session, screen = buildScreen(session), effects = effects, timelineMessage = timelineMessage)
+                    }
+                    nodeId = nextNodeByEvent(node, "NEXT")
+                }
 
                 "LOG_EVENT" -> {
                     timelineMessage = timelineMessageForNode(session, node, runtimeContext)
+                    nodeId = nextNodeByEvent(node, "NEXT")
+                }
+
+                "CALCULATE" -> {
+                    runtimeContext = runtimeContext + calculateFlowValue(session, node, readMap(node.configJson), runtimeContext)
                     nodeId = nextNodeByEvent(node, "NEXT")
                 }
 
@@ -1267,25 +1684,15 @@ class SessionStateMachineService(
                     nodeId = nextNodeByEvent(node, if (evaluateRuntimeCondition(session, node, runtimeContext)) "TRUE" else "FALSE")
                 }
 
-                "CALCULATE_WINNER" -> {
-                    val rule = readMap(node.configJson)["rule"]?.toString().orEmpty()
-                    val winner = calculateWinnerByRule(session, rule)
-                    runtimeContext = runtimeContext + mapOf("winner" to (winner?.toString() ?: ""))
-                    nodeId = nextNodeByEvent(node, "NEXT")
-                }
-
                 "END_GAME" -> {
                     val teams = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
-                    val winner = runtimeContext["winner"]?.let { runCatching { UUID.fromString(it) }.getOrNull() }
-                        ?: if (isEconomySession(session)) calculateWinnerByBalance(session) else calculateWinnerByRounds(session, teams)
-                    finishSession(session, winner, "FLOW_ENDED", teams.mapNotNull { it.id })
+                    finishSession(session, calculateConfiguredWinner(session, teams), "FLOW_ENDED", teams.mapNotNull { it.id })
                     return StateMachineResult(session = session, screen = buildScreen(session), effects = listOf("BEEP_WIN"), timelineMessage = timelineMessage)
                 }
 
                 else -> {
                     session.status = SessionStatus.RUNNING
-                    val parkedContext = if (node.type == "MENU") emptyMap() else runtimeContext
-                    session.currentStateKey = flowStateKey(node, context = parkedContext)
+                    session.currentStateKey = flowStateKey(node, context = runtimeContext)
                     sessionRepository.save(session)
                     return StateMachineResult(session = session, screen = buildScreen(session), effects = effects, timelineMessage = timelineMessage)
                 }
@@ -1307,32 +1714,48 @@ class SessionStateMachineService(
         context: Map<String, String>,
     ): MoneyTransferExecution? {
         val config = readMap(node.configJson)
-        val amount = context["amount"]?.toIntOrNull()
+        val amountFrom = config["amountFrom"]?.toString()?.takeIf { it.isNotBlank() }
+            ?: config["valueFrom"]?.toString()?.takeIf { it.isNotBlank() }
+        val amount = amountFrom?.let { numericValueForExpression(session, it, context)?.toInt() }
+            ?: context["amount"]?.toIntOrNull()
             ?: intConfig(config, "amount")
             ?: intConfig(config, "value")
             ?: bankStepConfig(session).smallStep
-        val payerPlayerId = context["player"]?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+        val source = config["source"]?.toString()?.takeIf { it.isNotBlank() } ?: "player"
+        val payerPlayerId = playerIdForBuilderReference(source, context)
+            ?: context["player"]?.let { runCatching { UUID.fromString(it) }.getOrNull() }
         val selectedAction = context["selection"].orEmpty()
         val payerAccount = when {
             selectedAction.contains("Auszahlen", ignoreCase = true) -> bankAccount(session)
+            config["source"]?.toString() == "bank" -> bankAccount(session)
             payerPlayerId != null -> accountForPlayer(session, payerPlayerId)
-            else -> null
+            else -> accountForBuilderReference(session, source, context)
         } ?: return null
+        val targetExpression = config["target"]?.toString()?.takeIf { it.isNotBlank() }
         val targetAccount = when {
+            targetExpression == "selectedTarget" || targetExpression == "selectedAccount" -> accountForBuilderReference(session, targetExpression, context)
+            targetExpression != null && targetExpression != "bank" -> accountForBuilderReference(session, targetExpression, context)
             context["target"] != null -> accountRepository.findById(UUID.fromString(requireNotNull(context["target"]))).orElse(null)
                 ?.takeIf { it.sessionId == session.id }
             selectedAction.contains("Einzahlen", ignoreCase = true) -> bankAccount(session)
             selectedAction.contains("Auszahlen", ignoreCase = true) && payerPlayerId != null -> accountForPlayer(session, payerPlayerId)
-            config["target"]?.toString() == "bank" -> bankAccount(session)
+            targetExpression == "bank" -> bankAccount(session)
             else -> context["targetAccountId"]?.let { accountRepository.findById(UUID.fromString(it)).orElse(null) }
         } ?: return null
         if (payerAccount.id == targetAccount.id) return null
         val amountValue = BigDecimal.valueOf(amount.toLong())
-        if (payerAccount.ownerType != OwnerType.BANK && payerAccount.balance < amountValue) return null
-        payerAccount.balance = payerAccount.balance.subtract(amountValue)
-        targetAccount.balance = targetAccount.balance.add(amountValue)
-        accountRepository.save(payerAccount)
-        accountRepository.save(targetAccount)
+        val payerOwner = when (payerAccount.ownerType) {
+            OwnerType.BANK -> ValueOwner(OwnerType.BANK, requireNotNull(payerAccount.id))
+            OwnerType.TEAM -> ValueOwner(OwnerType.TEAM, requireNotNull(payerAccount.teamId))
+        }
+        val targetOwner = when (targetAccount.ownerType) {
+            OwnerType.BANK -> ValueOwner(OwnerType.BANK, requireNotNull(targetAccount.id))
+            OwnerType.TEAM -> ValueOwner(OwnerType.TEAM, requireNotNull(targetAccount.teamId))
+        }
+        val payerBalance = sessionValue(session, payerOwner.ownerType, payerOwner.ownerId, "money") ?: payerAccount.balance
+        if (payerAccount.ownerType != OwnerType.BANK && payerBalance < amountValue) return null
+        changeSessionValue(session, payerOwner.ownerType, payerOwner.ownerId, "money", amountValue, "SUBTRACT")
+        changeSessionValue(session, targetOwner.ownerType, targetOwner.ownerId, "money", amountValue, "ADD")
         moneyTransactionRepository.save(
             NfcMoneyTransaction().apply {
                 sessionId = session.id
@@ -1369,6 +1792,13 @@ class SessionStateMachineService(
             ?: context["lastAwardedPoints"]?.toIntOrNull()
             ?: 0
         val placeholders = context.mapValues { (key, value) -> displayValueForVariable(session, key, value) }.toMutableMap()
+        val template = readMap(node.configJson)["template"]?.toString()
+        template
+            ?.let { Regex("""\{([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?)\}""").findAll(it) }
+            ?.map { it.groupValues[1] }
+            ?.forEach { key ->
+                displayValueForExpression(session, key, context)?.let { placeholders[key] = it }
+            }
         scannedPlayerName?.let {
             placeholders["player"] = it
             placeholders["scannedPlayer"] = it
@@ -1383,7 +1813,7 @@ class SessionStateMachineService(
             targetLabel,
             amount,
             bankStepConfig(session).currency,
-            templateOverride = readMap(node.configJson)["template"]?.toString(),
+            templateOverride = template,
             extraPlaceholders = placeholders,
         )
     }
@@ -1398,6 +1828,22 @@ class SessionStateMachineService(
         accountLabel(session, value)?.let { return it }
         return teamRepository.findById(uuid).orElse(null)?.name ?: value
     }
+
+    private fun renderBuilderTemplate(session: NfcGameSession, template: String?, context: Map<String, String>): String? {
+        val raw = template?.takeIf { it.isNotBlank() } ?: return template
+        return Regex("""\{([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?)\}""").replace(raw) { match ->
+            val key = match.groupValues[1]
+            builderTemplateValue(session, key, context) ?: match.value
+        }
+    }
+
+    private fun builderTemplateValue(session: NfcGameSession, key: String, context: Map<String, String>): String? =
+        when (key) {
+            "teams" -> teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
+                .joinToString(", ") { it.name }
+            "currency" -> bankStepConfig(session).currency
+            else -> displayValueForExpression(session, key, context)
+        }
 
     private fun playerName(playerId: String): String? =
         runCatching { UUID.fromString(playerId) }.getOrNull()
@@ -1423,12 +1869,15 @@ class SessionStateMachineService(
                 } else {
                     items.getOrNull(currentSelectedIndex(session, items.size))
                 }
+                val storeAs = readMap(node.configJson)["storeAs"]?.toString()?.takeIf { it.isNotBlank() }
                 buildMap {
                     selected?.let {
                         if (isDynamicAccountMenu(node)) {
                             put("target", it.value)
+                            storeAs?.let { key -> put(key, it.value) }
                         } else {
                             put("selection", it.label)
+                            storeAs?.let { key -> put(key, it.label) }
                         }
                     }
                 }
@@ -1703,11 +2152,11 @@ class SessionStateMachineService(
             BankTarget(
                 accountId = requireNotNull(account.id),
                 label = memberNames?.let { "${team.name}: $it" } ?: team.name,
-                balance = account.balance,
+                balance = sessionValue(session, OwnerType.TEAM, requireNotNull(team.id), "money") ?: account.balance,
             )
         }
         val bankTarget = accounts.firstOrNull { it.ownerType == OwnerType.BANK }?.let {
-            BankTarget(requireNotNull(it.id), "Bank", it.balance)
+            BankTarget(requireNotNull(it.id), "Bank", sessionValue(session, OwnerType.BANK, requireNotNull(it.id), "money") ?: it.balance)
         }
         return teamTargets + listOfNotNull(bankTarget)
     }
@@ -1848,6 +2297,9 @@ class SessionStateMachineService(
     private fun currentNodeKey(session: NfcGameSession): String =
         session.currentStateKey.substringBefore("|")
 
+    private fun reloadSession(session: NfcGameSession): NfcGameSession =
+        sessionRepository.findById(requireNotNull(session.id)).orElse(session)
+
     private fun currentSelectedIndex(session: NfcGameSession, optionCount: Int): Int {
         if (optionCount <= 0) return 0
         return (stateInt(session, "sel") ?: 0).coerceIn(0, optionCount - 1)
@@ -1863,8 +2315,7 @@ class SessionStateMachineService(
 
     private fun applyNumberPickerValue(session: NfcGameSession, node: NfcFlowNode) {
         val config = readMap(node.configJson)
-        val storesRoundLimit = config["storeAs"]?.toString() == "roundLimit" ||
-            node.title.contains("Runden", ignoreCase = true)
+        val storesRoundLimit = config["storeAs"]?.toString() == "roundLimit"
         if (!storesRoundLimit) return
         session.roundLimitType = RoundLimitType.ROUNDS
         session.roundLimit = currentNumberValue(session, node)
@@ -1996,4 +2447,105 @@ class SessionStateMachineService(
         private const val BANK_PAY_SCAN_MODE = "bank:pay-scan"
         private const val MAX_RUNTIME_STEPS = 50
     }
+}
+
+private class ArithmeticExpressionParser(
+    private val source: String,
+    private val resolveToken: (String) -> BigDecimal?,
+) {
+    private var index = 0
+
+    fun parse(): BigDecimal? {
+        val value = parseExpression() ?: return null
+        skipWhitespace()
+        return if (index == source.length) value else null
+    }
+
+    private fun parseExpression(): BigDecimal? {
+        var value = parseTerm() ?: return null
+        while (true) {
+            skipWhitespace()
+            value = when (peek()) {
+                '+' -> {
+                    index += 1
+                    value + (parseTerm() ?: return null)
+                }
+                '-' -> {
+                    index += 1
+                    value - (parseTerm() ?: return null)
+                }
+                else -> return value
+            }
+        }
+    }
+
+    private fun parseTerm(): BigDecimal? {
+        var value = parseFactor() ?: return null
+        while (true) {
+            skipWhitespace()
+            value = when (peek()) {
+                '*' -> {
+                    index += 1
+                    value * (parseFactor() ?: return null)
+                }
+                '/' -> {
+                    index += 1
+                    val divisor = parseFactor() ?: return null
+                    if (divisor.compareTo(BigDecimal.ZERO) == 0) return null
+                    value.divide(divisor, MathContext.DECIMAL64)
+                }
+                else -> return value
+            }
+        }
+    }
+
+    private fun parseFactor(): BigDecimal? {
+        skipWhitespace()
+        return when (peek()) {
+            '+' -> {
+                index += 1
+                parseFactor()
+            }
+            '-' -> {
+                index += 1
+                parseFactor()?.negate()
+            }
+            '(' -> {
+                index += 1
+                val value = parseExpression() ?: return null
+                skipWhitespace()
+                if (peek() != ')') return null
+                index += 1
+                value
+            }
+            else -> parseValue()
+        }
+    }
+
+    private fun parseValue(): BigDecimal? {
+        skipWhitespace()
+        if (peek() == '{') {
+            index += 1
+            val start = index
+            while (index < source.length && source[index] != '}') index += 1
+            if (index >= source.length) return null
+            val token = source.substring(start, index)
+            index += 1
+            return resolveToken(token)
+        }
+        val start = index
+        if (peek()?.isDigit() == true || peek() == '.') {
+            while (index < source.length && (source[index].isDigit() || source[index] == '.')) index += 1
+            return source.substring(start, index).toBigDecimalOrNull()
+        }
+        while (index < source.length && (source[index].isLetterOrDigit() || source[index] in setOf('_', '.'))) index += 1
+        if (index == start) return null
+        return resolveToken(source.substring(start, index))
+    }
+
+    private fun skipWhitespace() {
+        while (index < source.length && source[index].isWhitespace()) index += 1
+    }
+
+    private fun peek(): Char? = source.getOrNull(index)
 }

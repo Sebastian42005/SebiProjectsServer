@@ -52,6 +52,8 @@ import org.springframework.web.multipart.MultipartFile
 import org.springframework.web.server.ResponseStatusException
 import java.util.UUID
 
+private const val PUBLICATION_MANAGER_USERNAME = "administrator4"
+
 @Service
 class NfcAdminService(
     private val playerRepository: NfcPlayerRepository,
@@ -295,9 +297,22 @@ class NfcAdminService(
     }
 
     fun currentAccountId(): Long {
+        return currentUser().id
+    }
+
+    fun canManagePublicationReviews(): Boolean =
+        currentUser().username == PUBLICATION_MANAGER_USERNAME
+
+    fun requirePublicationManager() {
+        if (!canManagePublicationReviews()) {
+            throw ResponseStatusException(HttpStatus.FORBIDDEN, "Only administrator4 can manage publication reviews")
+        }
+    }
+
+    private fun currentUser(): com.example.paulasserver.security.AuthenticatedUser {
         val principal = SecurityContextHolder.getContext().authentication?.principal
         if (principal is com.example.paulasserver.security.AuthenticatedUser) {
-            return principal.id
+            return principal
         }
         throw ResponseStatusException(HttpStatus.UNAUTHORIZED, "Login required")
     }
@@ -314,7 +329,7 @@ class NfcAdminService(
 
     fun ownedGameTemplate(id: UUID): NfcGameTemplate =
         gameTemplateRepository.findById(id).orElseThrow { notFound("Game template not found") }.also {
-            if (it.accountId != currentAccountId()) throw notFound("Game template not found")
+            if (it.accountId != currentAccountId() && !canManagePublicationReviews()) throw notFound("Game template not found")
         }
 
     private fun NfcPlayer.applyPlayerRequest(request: PlayerRequest) = apply {
@@ -353,9 +368,15 @@ class NfcAdminService(
         largeStep = request.largeStep
         winRuleType = request.winRuleType
         dashboardMetricSource = request.dashboardMetricSource?.takeIf { it.isNotBlank() } ?: "points"
-        dashboardMetricLabel = request.dashboardMetricLabel?.takeIf { it.isNotBlank() } ?: "Punkte"
+        dashboardMetricLabel = request.dashboardMetricLabel?.trim() ?: "Punkte"
         dashboardMetricSuffix = request.dashboardMetricSuffix?.takeIf { it.isNotBlank() }
         dashboardMetricSortDirection = request.dashboardMetricSortDirection?.takeIf { it.equals("ASC", true) || it.equals("DESC", true) }?.uppercase() ?: "DESC"
+        dashboardMetricDisplayType = request.dashboardMetricDisplayType?.takeIf { it.isNotBlank() }?.uppercase() ?: "RACE_BAR"
+        dashboardStatusSource = request.dashboardStatusSource?.trim()?.takeIf { it.isNotBlank() }
+        dashboardStatusLabel = request.dashboardStatusLabel?.trim() ?: "Runde"
+        dashboardStatusSuffix = request.dashboardStatusSuffix?.takeIf { it.isNotBlank() }
+        dashboardStatusMaxSource = request.dashboardStatusMaxSource?.takeIf { it.isNotBlank() }
+        dashboardStatusDisplayType = request.dashboardStatusDisplayType?.takeIf { it.isNotBlank() }?.uppercase() ?: "PROGRESS_BAR"
     }
 
     private fun toFlowResponse(

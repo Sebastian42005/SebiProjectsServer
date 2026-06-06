@@ -205,6 +205,18 @@ class NfcGameTemplate : NfcUuidEntity() {
 
     var dashboardMetricSortDirection: String? = "DESC"
 
+    var dashboardMetricDisplayType: String? = "RACE_BAR"
+
+    var dashboardStatusSource: String? = "currentRound"
+
+    var dashboardStatusLabel: String? = "Runde"
+
+    var dashboardStatusSuffix: String? = null
+
+    var dashboardStatusMaxSource: String? = "roundLimit"
+
+    var dashboardStatusDisplayType: String? = "PROGRESS_BAR"
+
     @Column(nullable = false, updatable = false)
     var createdAt: Instant = Instant.now()
 
@@ -440,7 +452,7 @@ class NfcGameSession : NfcUuidEntity() {
     @Column(nullable = false)
     var status: SessionStatus = SessionStatus.LOBBY
 
-    @Column(nullable = false)
+    @Column(nullable = false, columnDefinition = "text")
     var currentStateKey: String = "lobby"
 
     @Enumerated(EnumType.STRING)
@@ -535,6 +547,44 @@ class NfcSessionAccount : NfcUuidEntity() {
 
     @Column(nullable = false, updatable = false)
     var createdAt: Instant = Instant.now()
+}
+
+@Entity
+@Table(
+    name = "nfc_session_value",
+    uniqueConstraints = [UniqueConstraint(name = "uk_nfc_session_value_owner_key", columnNames = ["session_id", "owner_type", "owner_id", "value_key"])],
+    indexes = [
+        Index(name = "idx_nfc_session_value_session", columnList = "session_id"),
+        Index(name = "idx_nfc_session_value_key", columnList = "value_key"),
+    ],
+)
+class NfcSessionValue : NfcUuidEntity() {
+    @Column(name = "session_id", nullable = false)
+    var sessionId: UUID? = null
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "owner_type", nullable = false)
+    var ownerType: OwnerType = OwnerType.TEAM
+
+    @Column(name = "owner_id", nullable = false)
+    var ownerId: UUID? = null
+
+    @Column(name = "value_key", nullable = false)
+    var valueKey: String = "points"
+
+    @Column(nullable = false, precision = 14, scale = 2)
+    var value: BigDecimal = BigDecimal.ZERO
+
+    @Column(nullable = false, updatable = false)
+    var createdAt: Instant = Instant.now()
+
+    @Column(nullable = false)
+    var updatedAt: Instant = Instant.now()
+
+    @PreUpdate
+    fun touch() {
+        updatedAt = Instant.now()
+    }
 }
 
 @Entity

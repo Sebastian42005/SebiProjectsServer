@@ -173,6 +173,9 @@ class NfcAdminController(
     @GetMapping("/games")
     fun listGames(): List<GameTemplateResponse> = gameBuilderService.listGames()
 
+    @GetMapping("/games/publication-requests")
+    fun listPublicationRequests(): List<GameTemplateResponse> = gameBuilderService.listPublicationRequests()
+
     @PostMapping("/games")
     fun createGame(@Valid @RequestBody request: GameBasicRequest): GameTemplateResponse =
         gameBuilderService.createGame(request)
@@ -199,8 +202,14 @@ class NfcAdminController(
     @PostMapping("/games/{id}/duplicate")
     fun duplicateGame(@PathVariable id: UUID): GameTemplateResponse = gameBuilderService.duplicateGame(id)
 
-    @PostMapping("/games/{id}/publish")
-    fun publishGame(@PathVariable id: UUID): GameTemplateResponse = gameBuilderService.publishGame(id)
+    @PostMapping("/games/{id}/publication-request")
+    fun requestPublication(@PathVariable id: UUID): GameTemplateResponse = gameBuilderService.requestPublication(id)
+
+    @PostMapping("/games/{id}/approve-publication")
+    fun approvePublication(@PathVariable id: UUID): GameTemplateResponse = gameBuilderService.approvePublication(id)
+
+    @PostMapping("/games/{id}/reject-publication")
+    fun rejectPublication(@PathVariable id: UUID): GameTemplateResponse = gameBuilderService.rejectPublication(id)
 
     @GetMapping("/games/{id}/flow")
     fun getGameFlow(@PathVariable id: UUID): GameFlowResponse = gameBuilderService.getFlow(id)

@@ -116,6 +116,12 @@ data class GameTemplateRequest(
     val dashboardMetricLabel: String? = "Punkte",
     val dashboardMetricSuffix: String? = null,
     val dashboardMetricSortDirection: String? = "DESC",
+    val dashboardMetricDisplayType: String? = "RACE_BAR",
+    val dashboardStatusSource: String? = "currentRound",
+    val dashboardStatusLabel: String? = "Runde",
+    val dashboardStatusSuffix: String? = null,
+    val dashboardStatusMaxSource: String? = "roundLimit",
+    val dashboardStatusDisplayType: String? = "PROGRESS_BAR",
 )
 
 data class GameBasicRequest(
@@ -128,6 +134,12 @@ data class GameBasicRequest(
     val dashboardMetricLabel: String? = "Punkte",
     val dashboardMetricSuffix: String? = null,
     val dashboardMetricSortDirection: String? = "DESC",
+    val dashboardMetricDisplayType: String? = "RACE_BAR",
+    val dashboardStatusSource: String? = "currentRound",
+    val dashboardStatusLabel: String? = "Runde",
+    val dashboardStatusSuffix: String? = null,
+    val dashboardStatusMaxSource: String? = "roundLimit",
+    val dashboardStatusDisplayType: String? = "PROGRESS_BAR",
 )
 
 data class GameTemplateResponse(
@@ -153,6 +165,13 @@ data class GameTemplateResponse(
     val dashboardMetricLabel: String?,
     val dashboardMetricSuffix: String?,
     val dashboardMetricSortDirection: String?,
+    val dashboardMetricDisplayType: String?,
+    val dashboardStatusSource: String?,
+    val dashboardStatusLabel: String?,
+    val dashboardStatusSuffix: String?,
+    val dashboardStatusMaxSource: String?,
+    val dashboardStatusDisplayType: String?,
+    val ownedByCurrentAccount: Boolean = true,
     val createdAt: Instant,
     val updatedAt: Instant,
 )
@@ -348,6 +367,14 @@ data class SessionSummaryResponse(
     val dashboardMetricLabel: String = "Punkte",
     val dashboardMetricSuffix: String? = null,
     val dashboardMetricSortDirection: String = "DESC",
+    val dashboardMetricDisplayType: String = "RACE_BAR",
+    val dashboardStatusSource: String? = "currentRound",
+    val dashboardStatusLabel: String = "Runde",
+    val dashboardStatusSuffix: String? = null,
+    val dashboardStatusMaxSource: String? = "roundLimit",
+    val dashboardStatusDisplayType: String = "PROGRESS_BAR",
+    val dashboardStatusValue: BigDecimal? = null,
+    val dashboardStatusLimit: BigDecimal? = null,
     val deviceId: UUID,
     val status: SessionStatus,
     val currentStateKey: String,

@@ -46,6 +46,12 @@ class NfcGameBuilderService(
             .filter { it.active }
             .map(::toGameResponse)
 
+    fun listPublicationRequests(): List<GameTemplateResponse> {
+        adminService.requirePublicationManager()
+        return gameTemplateRepository.findAllByPublicationStatusAndActiveTrueOrderByUpdatedAtDesc(GamePublicationStatus.PENDING_REVIEW)
+            .map(::toGameResponse)
+    }
+
     fun getGame(id: UUID): GameTemplateResponse =
         toGameResponse(ownedGame(id))
 
@@ -63,6 +69,7 @@ class NfcGameBuilderService(
         game.imageContentType = contentType
         game.imageFileName = file.originalFilename ?: file.name
         game.imageUrl = null
+        resetPublicationStatusAfterEdit(game)
         return toGameResponse(gameTemplateRepository.save(game))
     }
 
@@ -105,9 +112,25 @@ class NfcGameBuilderService(
     @Transactional
     fun duplicateGame(id: UUID): GameTemplateResponse {
         val source = ownedGame(id)
+        val copy = createGameCopy(source, source.accountId, "${source.name} Kopie")
+        return toGameResponse(copy)
+    }
+
+    @Transactional
+    fun copyPublicGameToCurrentAccount(id: UUID): GameTemplateResponse {
+        val source = gameTemplateRepository.findById(id).orElseThrow { notFound("Game not found") }
+        if (!source.active || source.publicationStatus != GamePublicationStatus.PUBLISHED) {
+            throw notFound("Game not found")
+        }
+        val copy = createGameCopy(source, adminService.currentAccountId(), "${source.name} Kopie")
+        return toGameResponse(copy)
+    }
+
+    private fun createGameCopy(source: NfcGameTemplate, targetAccountId: Long?, copyName: String): NfcGameTemplate {
+        val sourceId = requireNotNull(source.id)
         val copy = gameTemplateRepository.save(
             NfcGameTemplate().apply {
-                name = "${source.name} Kopie"
+                name = copyName
                 description = source.description
                 imageUrl = source.imageUrl
                 imageContent = source.imageContent
@@ -116,15 +139,30 @@ class NfcGameBuilderService(
                 active = true
                 publicationStatus = GamePublicationStatus.DRAFT
                 flowVersion = 1
-                accountId = source.accountId
+                accountId = targetAccountId
+                allowTeams = source.allowTeams
+                minTeamSize = source.minTeamSize
+                maxTeamSize = source.maxTeamSize
+                supportsRoundLimit = source.supportsRoundLimit
+                economyEnabled = source.economyEnabled
+                startCapital = source.startCapital
+                smallStep = source.smallStep
+                largeStep = source.largeStep
+                winRuleType = source.winRuleType
                 dashboardMetricSource = source.dashboardMetricSource
                 dashboardMetricLabel = source.dashboardMetricLabel
                 dashboardMetricSuffix = source.dashboardMetricSuffix
                 dashboardMetricSortDirection = source.dashboardMetricSortDirection
+                dashboardMetricDisplayType = source.dashboardMetricDisplayType
+                dashboardStatusSource = source.dashboardStatusSource
+                dashboardStatusLabel = source.dashboardStatusLabel
+                dashboardStatusSuffix = source.dashboardStatusSuffix
+                dashboardStatusMaxSource = source.dashboardStatusMaxSource
+                dashboardStatusDisplayType = source.dashboardStatusDisplayType
             },
         )
         val copyId = requireNotNull(copy.id)
-        val sourceNodes = nodeRepository.findAllByGameTemplateIdOrderBySortOrderAsc(id)
+        val sourceNodes = nodeRepository.findAllByGameTemplateIdOrderBySortOrderAsc(sourceId)
         val copiedNodes = sourceNodes.map { sourceNode ->
             NfcFlowNode().apply {
                 gameTemplateId = copyId
@@ -142,7 +180,7 @@ class NfcGameBuilderService(
             requireNotNull(sourceNode.id) to requireNotNull(savedNode.id)
         }
         edgeRepository.saveAll(
-            edgeRepository.findAllByGameTemplateIdOrderByPriorityAsc(id).mapNotNull { sourceEdge ->
+            edgeRepository.findAllByGameTemplateIdOrderByPriorityAsc(sourceId).mapNotNull { sourceEdge ->
                 val newSource = idMap[sourceEdge.sourceNodeId] ?: return@mapNotNull null
                 val newTarget = idMap[sourceEdge.targetNodeId] ?: return@mapNotNull null
                 NfcFlowEdge().apply {
@@ -157,7 +195,7 @@ class NfcGameBuilderService(
             },
         )
         copy.startNodeId = source.startNodeId?.let { idMap[it] }
-        return toGameResponse(gameTemplateRepository.save(copy))
+        return gameTemplateRepository.save(copy)
     }
 
     fun getFlow(gameId: UUID): GameFlowResponse {
@@ -217,7 +255,7 @@ class NfcGameBuilderService(
         game.startNodeId = request.startNodeId?.let { clientToPersistedNodeIds[it] }
             ?: savedNodes.firstOrNull { it.type == "START" }?.id
             ?: persistedNodeIds.firstOrNull()
-        game.publicationStatus = GamePublicationStatus.DRAFT
+        resetPublicationStatusAfterEdit(game)
         gameTemplateRepository.save(game)
         return getFlow(gameId)
     }
@@ -230,7 +268,20 @@ class NfcGameBuilderService(
         )
 
     @Transactional
-    fun publishGame(gameId: UUID): GameTemplateResponse {
+    fun requestPublication(gameId: UUID): GameTemplateResponse {
+        val game = ownedGame(gameId)
+        val validation = validateFlow(gameId)
+        if (!validation.valid) {
+            throw ResponseStatusException(HttpStatus.BAD_REQUEST, validation.issues.joinToString("; ") { it.message })
+        }
+        game.publicationStatus = GamePublicationStatus.PENDING_REVIEW
+        game.active = true
+        return toGameResponse(gameTemplateRepository.save(game))
+    }
+
+    @Transactional
+    fun approvePublication(gameId: UUID): GameTemplateResponse {
+        adminService.requirePublicationManager()
         val game = ownedGame(gameId)
         val validation = validateFlow(gameId)
         if (!validation.valid) {
@@ -239,6 +290,14 @@ class NfcGameBuilderService(
         game.publicationStatus = GamePublicationStatus.PUBLISHED
         game.active = true
         game.flowVersion += 1
+        return toGameResponse(gameTemplateRepository.save(game))
+    }
+
+    @Transactional
+    fun rejectPublication(gameId: UUID): GameTemplateResponse {
+        adminService.requirePublicationManager()
+        val game = ownedGame(gameId)
+        game.publicationStatus = GamePublicationStatus.REJECTED
         return toGameResponse(gameTemplateRepository.save(game))
     }
 
@@ -340,11 +399,21 @@ class NfcGameBuilderService(
         }
         active = request.active
         dashboardMetricSource = request.dashboardMetricSource?.takeIf { it.isNotBlank() } ?: "points"
-        dashboardMetricLabel = request.dashboardMetricLabel?.takeIf { it.isNotBlank() } ?: "Punkte"
+        dashboardMetricLabel = request.dashboardMetricLabel?.trim() ?: "Punkte"
         dashboardMetricSuffix = request.dashboardMetricSuffix?.takeIf { it.isNotBlank() }
         dashboardMetricSortDirection = request.dashboardMetricSortDirection?.takeIf { it.equals("ASC", true) || it.equals("DESC", true) }?.uppercase() ?: "DESC"
-        if (publicationStatus != GamePublicationStatus.PUBLISHED) {
-            publicationStatus = GamePublicationStatus.DRAFT
+        dashboardMetricDisplayType = request.dashboardMetricDisplayType?.takeIf { it.isNotBlank() }?.uppercase() ?: "RACE_BAR"
+        dashboardStatusSource = request.dashboardStatusSource?.trim()?.takeIf { it.isNotBlank() }
+        dashboardStatusLabel = request.dashboardStatusLabel?.trim() ?: "Runde"
+        dashboardStatusSuffix = request.dashboardStatusSuffix?.takeIf { it.isNotBlank() }
+        dashboardStatusMaxSource = request.dashboardStatusMaxSource?.takeIf { it.isNotBlank() }
+        dashboardStatusDisplayType = request.dashboardStatusDisplayType?.takeIf { it.isNotBlank() }?.uppercase() ?: "PROGRESS_BAR"
+        resetPublicationStatusAfterEdit(this)
+    }
+
+    private fun resetPublicationStatusAfterEdit(game: NfcGameTemplate) {
+        if (!adminService.canManagePublicationReviews()) {
+            game.publicationStatus = GamePublicationStatus.DRAFT
         }
     }
 
@@ -364,7 +433,11 @@ class NfcGameBuilderService(
         val cardUid = game.id?.let {
             cardRepository.findFirstByGameTemplateIdAndStatus(it, CardStatus.ASSIGNED)?.cardUid
         }
-        return mapper.toGameTemplateResponse(game, cardUid)
+        return mapper.toGameTemplateResponse(
+            game,
+            cardUid,
+            ownedByCurrentAccount = game.accountId == adminService.currentAccountId(),
+        )
     }
 
     private fun toFlowResponse(

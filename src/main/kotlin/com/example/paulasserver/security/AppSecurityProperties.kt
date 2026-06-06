@@ -30,7 +30,7 @@ data class JwtProperties(
     @field:NotBlank
     val secret: String = "",
     @field:Min(5)
-    val expirationMinutes: Long = 480,
+    val expirationMinutes: Long = 43200,
     val cookieName: String = "PAULAS_ACCESS_TOKEN",
     val secureCookie: Boolean = false,
 )

@@ -9,11 +9,15 @@ import com.example.paulasserver.nfcgame.api.dto.TeamMemberResponse
 import com.example.paulasserver.nfcgame.api.dto.TeamResponse
 import com.example.paulasserver.nfcgame.api.dto.TimelineEventResponse
 import com.example.paulasserver.nfcgame.application.NfcGameMapper
+import com.example.paulasserver.nfcgame.application.admin.NfcGameBuilderService
+import com.example.paulasserver.nfcgame.domain.GamePublicationStatus
 import com.example.paulasserver.nfcgame.application.session.SessionStateMachineService
 import com.example.paulasserver.nfcgame.domain.OwnerType
 import com.example.paulasserver.nfcgame.domain.SessionStatus
 import com.example.paulasserver.nfcgame.persistence.entity.NfcGameSession
 import com.example.paulasserver.nfcgame.persistence.entity.NfcPlayerStatsProjection
+import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionRound
+import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionValue
 import com.example.paulasserver.nfcgame.persistence.repository.NfcGameResultRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcGameSessionRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcGameTemplateRepository
@@ -25,6 +29,7 @@ import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionEventRe
 import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionRoundRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionTeamMemberRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionTeamRepository
+import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionValueRepository
 import com.fasterxml.jackson.core.type.TypeReference
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.springframework.http.HttpStatus
@@ -48,8 +53,10 @@ class NfcPublicQueryService(
     private val resultRepository: NfcGameResultRepository,
     private val eventRepository: NfcSessionEventRepository,
     private val roundRepository: NfcSessionRoundRepository,
+    private val valueRepository: NfcSessionValueRepository,
     private val statsRepository: NfcPlayerStatsProjectionRepository,
     private val mapper: NfcGameMapper,
+    private val gameBuilderService: NfcGameBuilderService,
     private val stateMachineService: SessionStateMachineService,
     private val messagingTemplate: SimpMessagingTemplate,
     private val objectMapper: ObjectMapper,
@@ -104,6 +111,13 @@ class NfcPublicQueryService(
             .orEmpty()
             .map(mapper::toGameTemplateResponse)
 
+    fun listPublicGames() =
+        gameTemplateRepository.findAllByPublicationStatusAndActiveTrueOrderByNameAsc(GamePublicationStatus.PUBLISHED)
+            .map { mapper.toGameTemplateResponse(it, ownedByCurrentAccount = false) }
+
+    fun addPublicGameToLibrary(gameId: UUID) =
+        gameBuilderService.copyPublicGameToCurrentAccount(gameId)
+
     fun getPlayerImage(playerId: UUID, accountId: Long?): ResponseEntity<ByteArray> {
         val player = playerRepository.findById(playerId).orElseThrow { notFound("Player not found") }
         if (accountId == null || player.accountId != accountId) throw notFound("Player not found")
@@ -116,7 +130,8 @@ class NfcPublicQueryService(
 
     fun getGameImage(gameId: UUID, accountId: Long?): ResponseEntity<ByteArray> {
         val game = gameTemplateRepository.findById(gameId).orElseThrow { notFound("Game template not found") }
-        if (accountId == null || game.accountId != accountId) throw notFound("Game template not found")
+        val canReadPublic = game.active && game.publicationStatus == GamePublicationStatus.PUBLISHED
+        if ((accountId == null || game.accountId != accountId) && !canReadPublic) throw notFound("Game template not found")
         val content = game.imageContent ?: throw notFound("Game image not found")
         val contentType = game.imageContentType ?: MediaType.APPLICATION_OCTET_STREAM_VALUE
         return ResponseEntity.status(HttpStatus.OK)
@@ -198,6 +213,7 @@ class NfcPublicQueryService(
         val result = resultRepository.findBySessionId(sessionId)
         val dashboardMetricConfig = dashboardMetricConfig(template)
         val rounds = roundRepository.findAllBySessionIdOrderByRoundNumberAsc(sessionId)
+        val values = valueRepository.findAllBySessionId(sessionId)
 
         return SessionSummaryResponse(
             id = sessionId,
@@ -205,23 +221,35 @@ class NfcPublicQueryService(
             gameName = template?.name,
             gameImageUrl = gameImageUrl(template),
             moneyCurrency = dashboardMetricConfig.suffix,
-            showBalancesOnDashboard = dashboardMetricConfig.source.equals("balance", ignoreCase = true),
+            showBalancesOnDashboard = dashboardMetricConfig.source.equals("balance", ignoreCase = true) || dashboardMetricConfig.source.equals("money", ignoreCase = true),
             dashboardMetricSource = dashboardMetricConfig.source,
             dashboardMetricLabel = dashboardMetricConfig.label,
             dashboardMetricSuffix = dashboardMetricConfig.suffix,
             dashboardMetricSortDirection = dashboardMetricConfig.sortDirection,
+            dashboardMetricDisplayType = dashboardMetricConfig.displayType,
+            dashboardStatusSource = dashboardMetricConfig.statusSource,
+            dashboardStatusLabel = dashboardMetricConfig.statusLabel,
+            dashboardStatusSuffix = dashboardMetricConfig.statusSuffix,
+            dashboardStatusMaxSource = dashboardMetricConfig.statusMaxSource,
+            dashboardStatusDisplayType = dashboardMetricConfig.statusDisplayType,
+            dashboardStatusValue = dashboardMetricConfig.statusSource
+                ?.let { dashboardStatusValue(it, session, rounds, values, dashboardMetricConfig.sortDirection) },
+            dashboardStatusLimit = dashboardMetricConfig.statusMaxSource
+                ?.let { dashboardStatusValue(it, session, rounds, values, dashboardMetricConfig.sortDirection) }
+                ?.takeIf { it > BigDecimal.ZERO },
             deviceId = requireNotNull(session.deviceId),
             status = session.status,
             currentStateKey = session.currentStateKey,
             roundLimitType = session.roundLimitType,
             roundLimit = session.roundLimit,
-            currentRoundNumber = session.currentRoundNumber,
+            currentRoundNumber = effectiveCurrentRoundNumber(session, rounds),
             createdAt = session.createdAt,
             startedAt = session.startedAt,
             endedAt = session.endedAt,
             teams = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(sessionId).map { team ->
                 val teamId = requireNotNull(team.id)
-                val balance = accounts.firstOrNull { it.ownerType == OwnerType.TEAM && it.teamId == teamId }?.balance
+                val balance = values.firstOrNull { it.ownerType == OwnerType.TEAM && it.ownerId == teamId && it.valueKey == "money" }?.value
+                    ?: accounts.firstOrNull { it.ownerType == OwnerType.TEAM && it.teamId == teamId }?.balance
                 TeamResponse(
                     id = teamId,
                     name = team.name,
@@ -229,7 +257,7 @@ class NfcPublicQueryService(
                     targetSize = team.targetSize,
                     status = team.status,
                     balance = balance,
-                    dashboardMetricValue = dashboardMetricValue(dashboardMetricConfig.source, teamId, balance, rounds),
+                    dashboardMetricValue = dashboardMetricValue(dashboardMetricConfig.source, teamId, balance, rounds, values),
                     members = memberRepository.findAllBySessionTeamId(teamId).map { member ->
                         val player = member.playerId?.let { playerRepository.findById(it).orElse(null) }
                         TeamMemberResponse(
@@ -264,40 +292,68 @@ class NfcPublicQueryService(
 
     private fun dashboardMetricConfig(template: com.example.paulasserver.nfcgame.persistence.entity.NfcGameTemplate?): DashboardMetricConfig {
         val gameTemplateId = template?.id
-        val dashboardNodeConfig = gameTemplateId
-            ?.let { flowNodeRepository.findAllByGameTemplateIdOrderBySortOrderAsc(it) }
-            ?.firstOrNull { it.type == "DASHBOARD_METRIC" }
-            ?.let { readMap(it.configJson) }
-            .orEmpty()
         val bankConfig = gameTemplateId
             ?.let { flowNodeRepository.findAllByGameTemplateIdOrderBySortOrderAsc(it) }
             ?.firstOrNull { it.type == "ENABLE_BANK" }
             ?.let { readMap(it.configJson) }
             .orEmpty()
-        val fallbackSource = template?.dashboardMetricSource ?: if (bankConfig.isNotEmpty()) "balance" else "points"
+        val fallbackSource = template?.dashboardMetricSource ?: if (bankConfig.isNotEmpty()) "money" else "points"
         return DashboardMetricConfig(
-            source = dashboardNodeConfig["source"]?.toString()?.takeIf { it.isNotBlank() }
-                ?: fallbackSource,
-            label = dashboardNodeConfig["label"]?.toString()?.takeIf { it.isNotBlank() }
-                ?: template?.dashboardMetricLabel?.takeIf { it.isNotBlank() }
-                ?: if (fallbackSource.equals("balance", ignoreCase = true)) "Kontostand" else "Punkte",
-            suffix = dashboardNodeConfig["suffix"]?.toString()?.takeIf { it.isNotBlank() }
-                ?: template?.dashboardMetricSuffix?.takeIf { it.isNotBlank() }
+            source = fallbackSource,
+            label = template?.dashboardMetricLabel?.trim()
+                ?: if (fallbackSource.equals("balance", ignoreCase = true) || fallbackSource.equals("money", ignoreCase = true)) "Geld" else "Punkte",
+            suffix = template?.dashboardMetricSuffix?.takeIf { it.isNotBlank() }
                 ?: bankConfig["currency"]?.toString()?.takeIf { it.isNotBlank() },
-            sortDirection = dashboardNodeConfig["sortDirection"]?.toString()?.takeIf { it.equals("ASC", true) || it.equals("DESC", true) }?.uppercase()
-                ?: template?.dashboardMetricSortDirection?.takeIf { it.equals("ASC", true) || it.equals("DESC", true) }?.uppercase()
+            sortDirection = template?.dashboardMetricSortDirection?.takeIf { it.equals("ASC", true) || it.equals("DESC", true) }?.uppercase()
                 ?: "DESC",
+            displayType = template?.dashboardMetricDisplayType?.takeIf { it.isNotBlank() }?.uppercase() ?: "RACE_BAR",
+            statusSource = template?.dashboardStatusSource?.trim()?.takeIf { it.isNotBlank() } ?: if (template == null) "currentRound" else null,
+            statusLabel = template?.dashboardStatusLabel?.trim() ?: "Runde",
+            statusSuffix = template?.dashboardStatusSuffix?.takeIf { it.isNotBlank() },
+            statusMaxSource = template?.dashboardStatusMaxSource?.takeIf { it.isNotBlank() },
+            statusDisplayType = template?.dashboardStatusDisplayType?.takeIf { it.isNotBlank() }?.uppercase() ?: "PROGRESS_BAR",
         )
     }
+
+    private fun dashboardStatusValue(
+        source: String,
+        session: NfcGameSession,
+        rounds: List<NfcSessionRound>,
+        values: List<NfcSessionValue>,
+        sortDirection: String,
+    ): BigDecimal? =
+        when (normalizeValueKey(source)) {
+            "currentround", "round", "currentroundnumber" -> effectiveCurrentRoundNumber(session, rounds).toBigDecimal()
+            "roundlimit" -> session.roundLimit?.toBigDecimal()
+            "players", "playercount", "totalplayers" -> teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
+                .sumOf { team -> memberRepository.findAllBySessionTeamId(requireNotNull(team.id)).size }
+                .toBigDecimal()
+            "teams", "teamcount" -> teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
+                .count { it.status != "CONFIGURING" }
+                .toBigDecimal()
+            else -> {
+                val normalizedSource = normalizeValueKey(source)
+                val teamValues = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id)).map { team ->
+                    val teamId = requireNotNull(team.id)
+                    val balance = valueRepository.findAllBySessionId(requireNotNull(session.id))
+                        .firstOrNull { it.ownerType == OwnerType.TEAM && it.ownerId == teamId && it.valueKey == "money" }
+                        ?.value
+                    dashboardMetricValue(normalizedSource, teamId, balance, rounds, values)
+                }
+                if (sortDirection.equals("ASC", ignoreCase = true)) teamValues.minOrNull() else teamValues.maxOrNull()
+            }
+        }
 
     private fun dashboardMetricValue(
         source: String,
         teamId: UUID,
         balance: BigDecimal?,
-        rounds: List<com.example.paulasserver.nfcgame.persistence.entity.NfcSessionRound>,
+        rounds: List<NfcSessionRound>,
+        values: List<NfcSessionValue>,
     ): BigDecimal =
-        when (source.lowercase()) {
-            "balance", "money", "kontostand" -> balance ?: BigDecimal.ZERO
+        values.firstOrNull { it.ownerType == OwnerType.TEAM && it.ownerId == teamId && it.valueKey == normalizeValueKey(source) }?.value
+            ?: when (normalizeValueKey(source)) {
+            "money" -> balance ?: BigDecimal.ZERO
             "rounds", "wins", "roundwins" -> BigDecimal.valueOf(rounds.count { it.winningTeamId == teamId }.toLong())
             else -> BigDecimal.valueOf(
                 rounds
@@ -307,11 +363,29 @@ class NfcPublicQueryService(
             )
         }
 
+    private fun effectiveCurrentRoundNumber(session: NfcGameSession, rounds: List<NfcSessionRound>): Int {
+        val maxRecordedRound = rounds.maxOfOrNull { it.roundNumber } ?: 0
+        return if (maxRecordedRound > 0) maxRecordedRound else session.currentRoundNumber
+    }
+
+    private fun normalizeValueKey(valueKey: String): String =
+        when (valueKey.trim().lowercase()) {
+            "score", "punkt", "punkte" -> "points"
+            "balance", "kontostand", "geld" -> "money"
+            else -> valueKey.trim().lowercase()
+        }
+
     private data class DashboardMetricConfig(
         val source: String = "points",
         val label: String = "Punkte",
         val suffix: String? = null,
         val sortDirection: String = "DESC",
+        val displayType: String = "RACE_BAR",
+        val statusSource: String? = "currentRound",
+        val statusLabel: String = "Runde",
+        val statusSuffix: String? = null,
+        val statusMaxSource: String? = "roundLimit",
+        val statusDisplayType: String = "PROGRESS_BAR",
     )
 
     private fun notFound(message: String) = ResponseStatusException(HttpStatus.NOT_FOUND, message)

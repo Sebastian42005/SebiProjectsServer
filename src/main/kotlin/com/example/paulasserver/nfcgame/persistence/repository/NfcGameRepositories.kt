@@ -1,6 +1,8 @@
 package com.example.paulasserver.nfcgame.persistence.repository
 
 import com.example.paulasserver.nfcgame.domain.CardStatus
+import com.example.paulasserver.nfcgame.domain.GamePublicationStatus
+import com.example.paulasserver.nfcgame.domain.OwnerType
 import com.example.paulasserver.nfcgame.domain.SessionStatus
 import com.example.paulasserver.nfcgame.persistence.entity.NfcAdminUser
 import com.example.paulasserver.nfcgame.persistence.entity.NfcCard
@@ -21,6 +23,7 @@ import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionEvent
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionRound
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionTeam
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionTeamMember
+import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionValue
 import org.springframework.data.jpa.repository.JpaRepository
 import org.springframework.data.jpa.repository.Query
 import java.util.UUID
@@ -59,6 +62,8 @@ interface NfcGameTemplateRepository : JpaRepository<NfcGameTemplate, UUID> {
     fun findAllByOrderByUpdatedAtDesc(): List<NfcGameTemplate>
     fun findAllByAccountIdOrderByUpdatedAtDesc(accountId: Long): List<NfcGameTemplate>
     fun findAllByAccountIdAndActiveTrueOrderByNameAsc(accountId: Long): List<NfcGameTemplate>
+    fun findAllByPublicationStatusAndActiveTrueOrderByUpdatedAtDesc(status: GamePublicationStatus): List<NfcGameTemplate>
+    fun findAllByPublicationStatusAndActiveTrueOrderByNameAsc(status: GamePublicationStatus): List<NfcGameTemplate>
     fun deleteAllByAccountId(accountId: Long)
 }
 
@@ -126,6 +131,13 @@ interface NfcSessionRoundRepository : JpaRepository<NfcSessionRound, UUID> {
 
 interface NfcSessionAccountRepository : JpaRepository<NfcSessionAccount, UUID> {
     fun findAllBySessionId(sessionId: UUID): List<NfcSessionAccount>
+    fun deleteAllBySessionId(sessionId: UUID)
+}
+
+interface NfcSessionValueRepository : JpaRepository<NfcSessionValue, UUID> {
+    fun findAllBySessionId(sessionId: UUID): List<NfcSessionValue>
+    fun findAllBySessionIdAndValueKey(sessionId: UUID, valueKey: String): List<NfcSessionValue>
+    fun findBySessionIdAndOwnerTypeAndOwnerIdAndValueKey(sessionId: UUID, ownerType: OwnerType, ownerId: UUID, valueKey: String): NfcSessionValue?
     fun deleteAllBySessionId(sessionId: UUID)
 }
 

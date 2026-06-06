@@ -74,5 +74,7 @@ enum class AdminRole {
 
 enum class GamePublicationStatus {
     DRAFT,
+    PENDING_REVIEW,
     PUBLISHED,
+    REJECTED,
 }

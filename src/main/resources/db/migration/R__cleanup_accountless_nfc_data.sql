@@ -10,25 +10,38 @@ drop table if exists nfc_cleanup_target_sessions;
 drop table if exists nfc_cleanup_target_devices;
 drop table if exists nfc_cleanup_target_games;
 drop table if exists nfc_cleanup_target_players;
+drop table if exists nfc_cleanup_existing_accounts;
+
+create temporary table nfc_cleanup_existing_accounts (
+    id bigint primary key
+);
+
+do $$
+begin
+    if to_regclass('public.app_user') is not null then
+        insert into nfc_cleanup_existing_accounts(id)
+        select id from app_user;
+    end if;
+end $$;
 
 create temporary table nfc_cleanup_target_players as
 select p.id
 from nfc_player p
-left join app_user u on u.id = p.account_id
+left join nfc_cleanup_existing_accounts u on u.id = p.account_id
 where p.account_id is null
    or u.id is null;
 
 create temporary table nfc_cleanup_target_games as
 select g.id
 from nfc_game_template g
-left join app_user u on u.id = g.account_id
+left join nfc_cleanup_existing_accounts u on u.id = g.account_id
 where g.account_id is null
    or u.id is null;
 
 create temporary table nfc_cleanup_target_devices as
 select d.id
 from nfc_device d
-left join app_user u on u.id = d.account_id
+left join nfc_cleanup_existing_accounts u on u.id = d.account_id
 where d.account_id is null
    or u.id is null;
 
@@ -37,7 +50,7 @@ select s.id
 from nfc_game_session s
 left join nfc_game_template g on g.id = s.game_template_id
 left join nfc_device d on d.id = s.device_id
-left join app_user u on u.id = s.account_id
+left join nfc_cleanup_existing_accounts u on u.id = s.account_id
 where s.account_id is null
    or u.id is null
    or g.account_id is null
@@ -62,7 +75,7 @@ where game_template_id in (select id from nfc_cleanup_target_games);
 create temporary table nfc_cleanup_target_cards as
 select c.id
 from nfc_card c
-left join app_user u on u.id = c.account_id
+left join nfc_cleanup_existing_accounts u on u.id = c.account_id
 where c.account_id is null
    or u.id is null
    or c.player_id in (select id from nfc_cleanup_target_players)
@@ -81,6 +94,11 @@ where session_id in (select id from nfc_cleanup_target_sessions)
 delete from nfc_session_round
 where session_id in (select id from nfc_cleanup_target_sessions)
    or winning_team_id in (select id from nfc_cleanup_target_teams);
+
+delete from nfc_session_value
+where session_id in (select id from nfc_cleanup_target_sessions)
+   or owner_id in (select id from nfc_cleanup_target_teams)
+   or owner_id in (select id from nfc_cleanup_target_session_accounts);
 
 delete from nfc_session_team_member
 where session_team_id in (select id from nfc_cleanup_target_teams)
@@ -137,3 +155,4 @@ drop table if exists nfc_cleanup_target_sessions;
 drop table if exists nfc_cleanup_target_devices;
 drop table if exists nfc_cleanup_target_games;
 drop table if exists nfc_cleanup_target_players;
+drop table if exists nfc_cleanup_existing_accounts;

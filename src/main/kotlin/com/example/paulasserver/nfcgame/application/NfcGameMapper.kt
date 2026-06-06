@@ -43,7 +43,11 @@ class NfcGameMapper {
         createdAt = device.createdAt,
     )
 
-    fun toGameTemplateResponse(template: NfcGameTemplate, cardUid: String? = null) = GameTemplateResponse(
+    fun toGameTemplateResponse(
+        template: NfcGameTemplate,
+        cardUid: String? = null,
+        ownedByCurrentAccount: Boolean = true,
+    ) = GameTemplateResponse(
         id = requireNotNull(template.id),
         name = template.name,
         description = template.description,
@@ -66,6 +70,13 @@ class NfcGameMapper {
         dashboardMetricLabel = template.dashboardMetricLabel,
         dashboardMetricSuffix = template.dashboardMetricSuffix,
         dashboardMetricSortDirection = template.dashboardMetricSortDirection,
+        dashboardMetricDisplayType = template.dashboardMetricDisplayType,
+        dashboardStatusSource = template.dashboardStatusSource,
+        dashboardStatusLabel = template.dashboardStatusLabel,
+        dashboardStatusSuffix = template.dashboardStatusSuffix,
+        dashboardStatusMaxSource = template.dashboardStatusMaxSource,
+        dashboardStatusDisplayType = template.dashboardStatusDisplayType,
+        ownedByCurrentAccount = ownedByCurrentAccount,
         createdAt = template.createdAt,
         updatedAt = template.updatedAt,
     )
