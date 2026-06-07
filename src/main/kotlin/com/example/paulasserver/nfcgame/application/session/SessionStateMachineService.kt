@@ -52,6 +52,13 @@ data class StateMachineResult(
     val effects: List<String> = emptyList(),
     val errors: List<String> = emptyList(),
     val timelineMessage: String? = null,
+    val popupTitle: String? = null,
+    val popupText: String? = null,
+)
+
+private data class FlowPopup(
+    val title: String?,
+    val text: String,
 )
 
 private data class BankTarget(
@@ -517,6 +524,7 @@ class SessionStateMachineService(
         var winningTeamId: UUID? = scannedWinningTeamId
         var roundRecorded = false
         var timelineMessage: String? = null
+        var popup: FlowPopup? = null
         var runtimeContext = mapOf(
             "player" to scannedPlayerId.toString(),
             "scannedPlayer" to scannedPlayerId.toString(),
@@ -527,9 +535,9 @@ class SessionStateMachineService(
         )
         repeat(MAX_RUNTIME_STEPS) {
             val node = nodeId?.let { flowNodeRepository.findById(it).orElse(null) }
-                ?: return finishFlowFallback(session, teams, winningTeamId, timelineMessage)
+                ?: return finishFlowFallback(session, teams, winningTeamId, timelineMessage, popup)
             when (node.type) {
-                "AWARD_POINTS", "AWARD_ROUND_WIN" -> {
+                "CHANGE_VALUE", "AWARD_POINTS", "ADD_GLOBAL_POINTS", "AWARD_ROUND_WIN" -> {
                     if (!roundRecorded) {
                         val resultContext = applyPointsNode(session, node, readMap(node.configJson), runtimeContext)
                         roundRecorded = true
@@ -547,6 +555,11 @@ class SessionStateMachineService(
                     nodeId = nextNodeByEvent(node, "NEXT")
                 }
 
+                "SHOW_POPUP" -> {
+                    popup = popupForNode(session, node, runtimeContext)
+                    nodeId = nextNodeByEvent(node, "NEXT")
+                }
+
                 "CALCULATE" -> {
                     runtimeContext = runtimeContext + calculateFlowValue(session, node, readMap(node.configJson), runtimeContext)
                     nodeId = nextNodeByEvent(node, "NEXT")
@@ -554,20 +567,34 @@ class SessionStateMachineService(
 
                 "END_GAME" -> {
                     finishSession(session, calculateConfiguredWinner(session, teams), "FLOW_ENDED", teams.mapNotNull { it.id })
-                    return StateMachineResult(session = session, screen = buildScreen(session), effects = listOf("BEEP_WIN"), timelineMessage = timelineMessage)
+                    return StateMachineResult(
+                        session = session,
+                        screen = buildScreen(session),
+                        effects = listOf("BEEP_WIN"),
+                        timelineMessage = timelineMessage,
+                        popupTitle = popup?.title,
+                        popupText = popup?.text,
+                    )
                 }
 
                 "WAIT_PLAYER_CARD", "WAIT_ANY_CARD", "WAIT_GAME_CARD" -> {
                     session.status = SessionStatus.RUNNING
                     session.currentStateKey = flowStateKey(node, context = runtimeContext)
                     sessionRepository.save(session)
-                    return StateMachineResult(session = session, screen = buildScreen(session), effects = listOf("BEEP_SUCCESS"), timelineMessage = timelineMessage)
+                    return StateMachineResult(
+                        session = session,
+                        screen = buildScreen(session),
+                        effects = listOf("BEEP_SUCCESS"),
+                        timelineMessage = timelineMessage,
+                        popupTitle = popup?.title,
+                        popupText = popup?.text,
+                    )
                 }
 
                 else -> nodeId = nextNodeByEvent(node, "NEXT")
             }
         }
-        return finishFlowFallback(session, teams, winningTeamId, timelineMessage)
+        return finishFlowFallback(session, teams, winningTeamId, timelineMessage, popup)
     }
 
     private fun finishFlowFallback(
@@ -575,11 +602,19 @@ class SessionStateMachineService(
         teams: List<NfcSessionTeam>,
         winningTeamId: UUID?,
         timelineMessage: String? = null,
+        popup: FlowPopup? = null,
     ): StateMachineResult {
         val calculatedWinner = calculateConfiguredWinner(session, teams)
         val winnerForResult = if (calculatedWinner != null || hasRecordedRounds(session)) calculatedWinner else winningTeamId
         finishSession(session, winnerForResult, "FLOW_ENDED", teams.mapNotNull { it.id })
-        return StateMachineResult(session = session, screen = buildScreen(session), effects = listOf("BEEP_WIN"), timelineMessage = timelineMessage)
+        return StateMachineResult(
+            session = session,
+            screen = buildScreen(session),
+            effects = listOf("BEEP_WIN"),
+            timelineMessage = timelineMessage,
+            popupTitle = popup?.title,
+            popupText = popup?.text,
+        )
     }
 
     private fun recordRoundWin(session: NfcGameSession, winningTeamId: UUID, points: Int) {
@@ -632,6 +667,10 @@ class SessionStateMachineService(
         }
     }
 
+    private fun advanceSessionRound(session: NfcGameSession) {
+        session.currentRoundNumber = effectiveCurrentRoundNumber(session) + 1
+    }
+
     private fun setSessionPoints(session: NfcGameSession, teamIds: Collection<UUID>, points: Int) {
         val deltasByTeam = teamIds.associateWith { teamId -> points - sessionPointsForTeam(session, teamId) }
             .filterValues { it != 0 }
@@ -672,6 +711,7 @@ class SessionStateMachineService(
         val owner = parts[0]
         val keyName = normalizeValueKey(parts[1])
         return when (keyName) {
+            "placement" -> placementForBuilderReference(session, owner, context)?.toBigDecimal()
             "rounds", "wins" -> teamIdForBuilderReference(session, owner, context)
                 ?.let { roundWinsForTeam(session, it).toBigDecimal() }
             else -> valueForBuilderReference(session, owner, keyName, context)
@@ -698,13 +738,13 @@ class SessionStateMachineService(
                 ?: numericValueForExpression(session, key, context)?.stripTrailingZeros()?.toPlainString()
         }
         val owner = parts[0]
-        return when (parts[1].lowercase()) {
+        return when (normalizeValueKey(parts[1])) {
             "name" -> playerIdForBuilderReference(owner, context)?.let { playerName(it.toString()) }
                 ?: accountForBuilderReference(session, owner, context)
                 ?.let { accountLabel(session, requireNotNull(it.id).toString()) }
                 ?: teamIdForBuilderReference(session, owner, context)?.let { teamLabel(it) }
             "team", "teamname" -> teamIdForBuilderReference(session, owner, context)?.let { teamLabel(it) }
-            "points", "score", "rounds", "wins", "money", "balance" -> numericValueForExpression(session, key, context)
+            "points", "rounds", "wins", "money", "placement" -> numericValueForExpression(session, key, context)
                 ?.stripTrailingZeros()
                 ?.toPlainString()
             else -> null
@@ -842,8 +882,50 @@ class SessionStateMachineService(
         when (valueKey.trim().removePrefix("{").removeSuffix("}").lowercase()) {
             "score", "punkt", "punkte" -> "points"
             "balance", "kontostand", "geld" -> "money"
+            "rank", "rang", "position", "place", "platz", "platzierung" -> "placement"
             else -> valueKey.trim().removePrefix("{").removeSuffix("}").lowercase()
         }
+
+    private data class TeamPlacement(val teamId: UUID, val value: BigDecimal, val teamOrder: Int, val name: String)
+
+    private fun rankedTeamPlacements(session: NfcGameSession, teams: List<NfcSessionTeam>): List<TeamPlacement> {
+        val template = session.gameTemplateId
+            ?.let { gameTemplateRepository.findById(it).orElse(null) }
+        val valueKey = normalizeValueKey(template?.dashboardMetricSource?.takeIf { it.isNotBlank() } ?: "points")
+        val lowest = template?.dashboardMetricSortDirection?.equals("ASC", ignoreCase = true) == true
+        return teams
+            .mapNotNull { team ->
+                val teamId = team.id ?: return@mapNotNull null
+                TeamPlacement(
+                    teamId = teamId,
+                    value = sessionValue(session, OwnerType.TEAM, teamId, valueKey)
+                        ?: legacyValueForOwner(session, OwnerType.TEAM, teamId, valueKey)
+                        ?: BigDecimal.ZERO,
+                    teamOrder = team.teamOrder,
+                    name = team.name,
+                )
+            }
+            .let { placements ->
+                val byValue = if (lowest) {
+                    compareBy<TeamPlacement> { it.value }
+                } else {
+                    compareByDescending<TeamPlacement> { it.value }
+                }
+                placements.sortedWith(byValue.thenBy { it.teamOrder }.thenBy { it.name })
+            }
+    }
+
+    private fun placementForBuilderReference(session: NfcGameSession, reference: String, context: Map<String, String>): Int? {
+        val teamId = teamIdForBuilderReference(session, reference, context) ?: return null
+        return placementForTeam(session, teamId)
+    }
+
+    private fun placementForTeam(session: NfcGameSession, targetTeamId: UUID): Int? {
+        val placements = rankedTeamPlacements(session, teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id)))
+        return placements.indexOfFirst { it.teamId == targetTeamId }
+            .takeIf { it >= 0 }
+            ?.plus(1)
+    }
 
     private fun teamIdForBuilderReferenceWithoutAccountLookup(session: NfcGameSession, reference: String, context: Map<String, String>): UUID? {
         context["${reference}Team"]?.let { value -> runCatching { UUID.fromString(value) }.getOrNull()?.let { return it } }
@@ -934,7 +1016,7 @@ class SessionStateMachineService(
         config: Map<String, Any?>,
         context: Map<String, String>,
     ): Map<String, String> {
-        val isGlobalValueNode = node.type == "AWARD_ROUND_WIN" || config["scope"]?.toString() == "GLOBAL_STATS"
+        val isGlobalValueNode = node.type in setOf("ADD_GLOBAL_POINTS", "AWARD_ROUND_WIN")
         val points = if (isGlobalValueNode) {
             pointsForNode(session, config, context).coerceAtLeast(0)
         } else {
@@ -987,13 +1069,8 @@ class SessionStateMachineService(
         }
         if (isGlobalValueNode) {
             targetOwners.filter { it.ownerType == OwnerType.TEAM }.forEach { recordRoundWin(session, it.ownerId, points) }
-        } else if (valueKey == "points" && config["advanceRound"] != false) {
-            recordSessionPointDeltas(
-                session,
-                valueDeltas
-                    .filterKeys { it.ownerType == OwnerType.TEAM }
-                    .mapKeys { it.key.ownerId },
-            )
+        } else if (valueKey == "points" && config["advanceRound"] != false && valueDeltas.any { it.key.ownerType == OwnerType.TEAM }) {
+            advanceSessionRound(session)
         }
         val targetLabel = if (targetOwners.size == 1) labelForValueOwner(session, targetOwners.first()) else "Alle Teams"
         val firstDelta = valueDeltas[targetOwners.first()] ?: amount
@@ -1234,7 +1311,29 @@ class SessionStateMachineService(
                 },
             )
         }
-        statisticsService.recordGameFinished(allTeamIds, winningTeamId)
+        statisticsService.recordGameFinished(allTeamIds, winningTeamId, placementPointAwards(session, winningTeamId, allTeamIds))
+    }
+
+    private fun placementPointAwards(session: NfcGameSession, winningTeamId: UUID?, allTeamIds: Collection<UUID>): Map<UUID, Long> {
+        if (winningTeamId == null) return emptyMap()
+        val template = session.gameTemplateId
+            ?.let { gameTemplateRepository.findById(it).orElse(null) }
+        val awards = linkedMapOf<UUID, Long>()
+        val winnerPoints = template?.globalWinnerPoints ?: 5
+        if (winnerPoints > 0) awards[winningTeamId] = winnerPoints
+
+        val remainingPlacements = rankedTeamPlacements(
+            session,
+            teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
+                .filter { it.id in allTeamIds && it.id != winningTeamId },
+        )
+        listOf(template?.globalSecondPlacePoints, template?.globalThirdPlacePoints)
+            .forEachIndexed { index, points ->
+                val teamId = remainingPlacements.getOrNull(index)?.teamId ?: return@forEachIndexed
+                val positivePoints = points?.takeIf { it > 0 } ?: return@forEachIndexed
+                awards[teamId] = positivePoints
+            }
+        return awards
     }
 
     private fun buildScreen(session: NfcGameSession): ScreenModel {
@@ -1630,11 +1729,19 @@ class SessionStateMachineService(
         var nodeId: UUID? = firstNodeId
         var runtimeContext = context
         var timelineMessage: String? = null
+        var popup: FlowPopup? = null
         repeat(MAX_RUNTIME_STEPS) {
             val node = nodeId?.let { flowNodeRepository.findById(it).orElse(null) }
-                ?: return StateMachineResult(session = session, screen = buildScreen(session), effects = effects, timelineMessage = timelineMessage)
+                ?: return StateMachineResult(
+                    session = session,
+                    screen = buildScreen(session),
+                    effects = effects,
+                    timelineMessage = timelineMessage,
+                    popupTitle = popup?.title,
+                    popupText = popup?.text,
+                )
             when (node.type) {
-                "AWARD_POINTS", "AWARD_ROUND_WIN" -> {
+                "CHANGE_VALUE", "AWARD_POINTS", "ADD_GLOBAL_POINTS", "AWARD_ROUND_WIN" -> {
                     val config = readMap(node.configJson)
                     runtimeContext = runtimeContext + applyPointsNode(session, node, config, runtimeContext)
                     nodeId = nextNodeByEventPreferringType(node, "NEXT", "LOG_EVENT")
@@ -1647,13 +1754,25 @@ class SessionStateMachineService(
                     if (continueMode == "BUTTON") {
                         session.currentStateKey = flowStateKey(node, context = runtimeContext)
                         sessionRepository.save(session)
-                        return StateMachineResult(session = session, screen = buildScreen(session), effects = effects, timelineMessage = timelineMessage)
+                        return StateMachineResult(
+                            session = session,
+                            screen = buildScreen(session),
+                            effects = effects,
+                            timelineMessage = timelineMessage,
+                            popupTitle = popup?.title,
+                            popupText = popup?.text,
+                        )
                     }
                     nodeId = nextNodeByEvent(node, "NEXT")
                 }
 
                 "LOG_EVENT" -> {
                     timelineMessage = timelineMessageForNode(session, node, runtimeContext)
+                    nodeId = nextNodeByEvent(node, "NEXT")
+                }
+
+                "SHOW_POPUP" -> {
+                    popup = popupForNode(session, node, runtimeContext)
                     nodeId = nextNodeByEvent(node, "NEXT")
                 }
 
@@ -1687,20 +1806,41 @@ class SessionStateMachineService(
                 "END_GAME" -> {
                     val teams = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
                     finishSession(session, calculateConfiguredWinner(session, teams), "FLOW_ENDED", teams.mapNotNull { it.id })
-                    return StateMachineResult(session = session, screen = buildScreen(session), effects = listOf("BEEP_WIN"), timelineMessage = timelineMessage)
+                    return StateMachineResult(
+                        session = session,
+                        screen = buildScreen(session),
+                        effects = listOf("BEEP_WIN"),
+                        timelineMessage = timelineMessage,
+                        popupTitle = popup?.title,
+                        popupText = popup?.text,
+                    )
                 }
 
                 else -> {
                     session.status = SessionStatus.RUNNING
                     session.currentStateKey = flowStateKey(node, context = runtimeContext)
                     sessionRepository.save(session)
-                    return StateMachineResult(session = session, screen = buildScreen(session), effects = effects, timelineMessage = timelineMessage)
+                    return StateMachineResult(
+                        session = session,
+                        screen = buildScreen(session),
+                        effects = effects,
+                        timelineMessage = timelineMessage,
+                        popupTitle = popup?.title,
+                        popupText = popup?.text,
+                    )
                 }
             }
         }
         session.currentStateKey = "running"
         sessionRepository.save(session)
-        return StateMachineResult(session = session, screen = buildScreen(session), effects = effects, timelineMessage = timelineMessage)
+        return StateMachineResult(
+            session = session,
+            screen = buildScreen(session),
+            effects = effects,
+            timelineMessage = timelineMessage,
+            popupTitle = popup?.title,
+            popupText = popup?.text,
+        )
     }
 
     private data class MoneyTransferExecution(
@@ -1816,6 +1956,17 @@ class SessionStateMachineService(
             templateOverride = template,
             extraPlaceholders = placeholders,
         )
+    }
+
+    private fun popupForNode(session: NfcGameSession, node: NfcFlowNode, context: Map<String, String>): FlowPopup? {
+        val config = readMap(node.configJson)
+        val title = renderBuilderTemplate(session, config["title"]?.toString(), context)?.takeIf { it.isNotBlank() }
+        val textTemplate = config["text"]?.toString()
+            ?: config["template"]?.toString()
+            ?: config["message"]?.toString()
+        val text = renderBuilderTemplate(session, textTemplate, context)?.takeIf { it.isNotBlank() }
+            ?: return title?.let { FlowPopup(title = null, text = it) }
+        return FlowPopup(title = title, text = text)
     }
 
     private fun displayValueForVariable(session: NfcGameSession, key: String, value: String): String {

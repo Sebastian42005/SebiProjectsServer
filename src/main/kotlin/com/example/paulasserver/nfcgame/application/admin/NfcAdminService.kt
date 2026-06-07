@@ -367,6 +367,9 @@ class NfcAdminService(
         smallStep = request.smallStep
         largeStep = request.largeStep
         winRuleType = request.winRuleType
+        globalWinnerPoints = request.globalWinnerPoints.coerceAtLeast(0)
+        globalSecondPlacePoints = request.globalSecondPlacePoints?.coerceAtLeast(0)
+        globalThirdPlacePoints = request.globalThirdPlacePoints?.coerceAtLeast(0)
         dashboardMetricSource = request.dashboardMetricSource?.takeIf { it.isNotBlank() } ?: "points"
         dashboardMetricLabel = request.dashboardMetricLabel?.trim() ?: "Punkte"
         dashboardMetricSuffix = request.dashboardMetricSuffix?.takeIf { it.isNotBlank() }

@@ -149,6 +149,9 @@ class NfcGameBuilderService(
                 smallStep = source.smallStep
                 largeStep = source.largeStep
                 winRuleType = source.winRuleType
+                globalWinnerPoints = source.globalWinnerPoints
+                globalSecondPlacePoints = source.globalSecondPlacePoints
+                globalThirdPlacePoints = source.globalThirdPlacePoints
                 dashboardMetricSource = source.dashboardMetricSource
                 dashboardMetricLabel = source.dashboardMetricLabel
                 dashboardMetricSuffix = source.dashboardMetricSuffix
@@ -398,6 +401,9 @@ class NfcGameBuilderService(
             imageFileName = null
         }
         active = request.active
+        globalWinnerPoints = request.globalWinnerPoints.coerceAtLeast(0)
+        globalSecondPlacePoints = request.globalSecondPlacePoints?.coerceAtLeast(0)
+        globalThirdPlacePoints = request.globalThirdPlacePoints?.coerceAtLeast(0)
         dashboardMetricSource = request.dashboardMetricSource?.takeIf { it.isNotBlank() } ?: "points"
         dashboardMetricLabel = request.dashboardMetricLabel?.trim() ?: "Punkte"
         dashboardMetricSuffix = request.dashboardMetricSuffix?.takeIf { it.isNotBlank() }

@@ -4,12 +4,14 @@ import com.example.paulasserver.nfcgame.application.statistics.NfcStatisticsServ
 import com.example.paulasserver.nfcgame.domain.CardStatus
 import com.example.paulasserver.nfcgame.domain.CardType
 import com.example.paulasserver.nfcgame.domain.EventType
+import com.example.paulasserver.nfcgame.domain.OwnerType
 import com.example.paulasserver.nfcgame.domain.SessionStatus
 import com.example.paulasserver.nfcgame.persistence.entity.NfcCard
 import com.example.paulasserver.nfcgame.persistence.entity.NfcDevice
 import com.example.paulasserver.nfcgame.persistence.entity.NfcFlowEdge
 import com.example.paulasserver.nfcgame.persistence.entity.NfcFlowNode
 import com.example.paulasserver.nfcgame.persistence.entity.NfcGameSession
+import com.example.paulasserver.nfcgame.persistence.entity.NfcGameTemplate
 import com.example.paulasserver.nfcgame.persistence.entity.NfcPlayer
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionRound
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionTeam
@@ -26,6 +28,7 @@ import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionAccount
 import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionRoundRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionTeamMemberRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionTeamRepository
+import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionValueRepository
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -36,6 +39,7 @@ import org.junit.jupiter.api.Test
 import org.mockito.ArgumentMatchers.any
 import org.mockito.ArgumentMatchers.anyCollection
 import org.mockito.Mockito.mock
+import org.mockito.Mockito.never
 import org.mockito.Mockito.verify
 import org.mockito.Mockito.`when`
 import java.util.Optional
@@ -52,6 +56,7 @@ class SessionStateMachineServiceTest {
     private val memberRepository = mock(NfcSessionTeamMemberRepository::class.java)
     private val roundRepository = mock(NfcSessionRoundRepository::class.java)
     private val accountRepository = mock(NfcSessionAccountRepository::class.java)
+    private val valueRepository = mock(NfcSessionValueRepository::class.java)
     private val moneyTransactionRepository = mock(NfcMoneyTransactionRepository::class.java)
     private val resultRepository = mock(NfcGameResultRepository::class.java)
     private val statisticsService = mock(NfcStatisticsService::class.java)
@@ -68,6 +73,7 @@ class SessionStateMachineServiceTest {
         memberRepository,
         roundRepository,
         accountRepository,
+        valueRepository,
         moneyTransactionRepository,
         resultRepository,
         statisticsService,
@@ -131,7 +137,7 @@ class SessionStateMachineServiceTest {
         val awardNode = NfcFlowNode().apply {
             id = awardNodeId
             this.gameTemplateId = gameTemplateId
-            type = "AWARD_POINTS"
+            type = "CHANGE_VALUE"
             title = "Punkt vergeben"
             configJson = """{"points":1,"target":"scannedPlayer"}"""
         }
@@ -163,6 +169,7 @@ class SessionStateMachineServiceTest {
         `when`(flowEdgeRepository.findAllByGameTemplateIdOrderByPriorityAsc(gameTemplateId)).thenReturn(listOf(scanToAward, awardToWait))
         `when`(roundRepository.save(any(NfcSessionRound::class.java))).thenAnswer { invocation -> invocation.arguments[0] }
         `when`(sessionRepository.save(any(NfcGameSession::class.java))).thenAnswer { invocation -> invocation.arguments[0] }
+        stubNoStoredTeamPoints(sessionId, teamId)
 
         val result = service.handleCardScan(device, "teddy-card")
 
@@ -170,7 +177,7 @@ class SessionStateMachineServiceTest {
         assertEquals(1, session.currentRoundNumber)
         assertTrue(session.currentStateKey.startsWith(waitNodeId.toString()))
         assertNotNull(result.screen)
-        verify(roundRepository).save(any(NfcSessionRound::class.java))
+        verify(roundRepository, never()).saveAll(anyCollection<NfcSessionRound>())
     }
 
     @Test
@@ -232,7 +239,7 @@ class SessionStateMachineServiceTest {
         val awardNode = NfcFlowNode().apply {
             id = awardNodeId
             this.gameTemplateId = gameTemplateId
-            type = "AWARD_POINTS"
+            type = "CHANGE_VALUE"
             title = "Punkt vergeben"
             configJson = """{"points":1,"target":"scannedPlayer"}"""
             sortOrder = 2
@@ -274,12 +281,119 @@ class SessionStateMachineServiceTest {
         `when`(flowEdgeRepository.findAllByGameTemplateIdOrderByPriorityAsc(gameTemplateId)).thenReturn(listOf(scanToAward, awardToLog))
         `when`(roundRepository.save(any(NfcSessionRound::class.java))).thenAnswer { invocation -> invocation.arguments[0] }
         `when`(sessionRepository.save(any(NfcGameSession::class.java))).thenAnswer { invocation -> invocation.arguments[0] }
+        stubNoStoredTeamPoints(sessionId, teamId)
 
         val result = service.handleCardScan(device, "teddy-card")
 
         assertEquals("Teddy hat 1 Test bekommen.", result.timelineMessage)
         assertEquals(1, session.currentRoundNumber)
-        verify(roundRepository).save(any(NfcSessionRound::class.java))
+        verify(roundRepository, never()).saveAll(anyCollection<NfcSessionRound>())
+    }
+
+    @Test
+    fun `builder templates can render the current placement for a scanned player`() {
+        val accountId = 42L
+        val deviceId = UUID.randomUUID()
+        val gameTemplateId = UUID.randomUUID()
+        val sessionId = UUID.randomUUID()
+        val playerId = UUID.randomUUID()
+        val leadingTeamId = UUID.randomUUID()
+        val scannedTeamId = UUID.randomUUID()
+        val waitNodeId = UUID.randomUUID()
+        val logNodeId = UUID.randomUUID()
+
+        val device = NfcDevice().apply {
+            id = deviceId
+            this.accountId = accountId
+        }
+        val template = NfcGameTemplate().apply {
+            id = gameTemplateId
+            dashboardMetricSource = "points"
+            dashboardMetricSortDirection = "DESC"
+        }
+        val session = NfcGameSession().apply {
+            id = sessionId
+            this.accountId = accountId
+            this.gameTemplateId = gameTemplateId
+            this.deviceId = deviceId
+            status = SessionStatus.RUNNING
+            currentStateKey = waitNodeId.toString()
+        }
+        val card = NfcCard().apply {
+            cardUid = "TEDDY-CARD"
+            cardType = CardType.PLAYER
+            status = CardStatus.ASSIGNED
+            this.playerId = playerId
+            this.accountId = accountId
+        }
+        val player = NfcPlayer().apply {
+            id = playerId
+            name = "Teddy"
+            active = true
+            this.accountId = accountId
+        }
+        val leadingTeam = NfcSessionTeam().apply {
+            id = leadingTeamId
+            this.sessionId = sessionId
+            name = "Team 1"
+            teamOrder = 1
+        }
+        val scannedTeam = NfcSessionTeam().apply {
+            id = scannedTeamId
+            this.sessionId = sessionId
+            name = "Team 2"
+            teamOrder = 2
+        }
+        val member = NfcSessionTeamMember().apply {
+            id = UUID.randomUUID()
+            sessionTeamId = scannedTeamId
+            this.playerId = playerId
+        }
+        val rounds = listOf(
+            round(sessionId, leadingTeamId, 1, 3),
+            round(sessionId, scannedTeamId, 2, 1),
+        )
+        val waitNode = NfcFlowNode().apply {
+            id = waitNodeId
+            this.gameTemplateId = gameTemplateId
+            type = "WAIT_PLAYER_CARD"
+            title = "Spielerkarte scannen"
+            configJson = """{"storeAs":"scannedPlayer"}"""
+            sortOrder = 1
+        }
+        val logNode = NfcFlowNode().apply {
+            id = logNodeId
+            this.gameTemplateId = gameTemplateId
+            type = "LOG_EVENT"
+            title = "Timeline schreiben"
+            configJson = """{"template":"{scannedPlayer.name} ist Platz {scannedPlayer.placement} / {scannedPlayer.rank} / {scannedPlayer.platzierung}."}"""
+            sortOrder = 2
+        }
+        val scanToLog = NfcFlowEdge().apply {
+            id = UUID.randomUUID()
+            this.gameTemplateId = gameTemplateId
+            sourceNodeId = waitNodeId
+            targetNodeId = logNodeId
+            eventType = "CARD_SCANNED"
+            priority = 1
+        }
+
+        `when`(cardRepository.findByCardUid("TEDDY-CARD")).thenReturn(card)
+        `when`(sessionRepository.findFirstByAccountIdAndStatusInOrderByCreatedAtDesc(accountId, listOf(SessionStatus.LOBBY, SessionStatus.CONFIGURING, SessionStatus.BUILDING_TEAMS, SessionStatus.READY, SessionStatus.RUNNING))).thenReturn(session)
+        `when`(gameTemplateRepository.findById(gameTemplateId)).thenReturn(Optional.of(template))
+        `when`(playerRepository.findById(playerId)).thenReturn(Optional.of(player))
+        `when`(teamRepository.findById(scannedTeamId)).thenReturn(Optional.of(scannedTeam))
+        `when`(teamRepository.findAllBySessionIdOrderByTeamOrderAsc(sessionId)).thenReturn(listOf(leadingTeam, scannedTeam))
+        `when`(memberRepository.findByPlayerIdAndSessionTeamIdIn(playerId, listOf(leadingTeamId, scannedTeamId))).thenReturn(member)
+        `when`(flowNodeRepository.findById(waitNodeId)).thenReturn(Optional.of(waitNode))
+        `when`(flowNodeRepository.findById(logNodeId)).thenReturn(Optional.of(logNode))
+        `when`(flowEdgeRepository.findAllByGameTemplateIdOrderByPriorityAsc(gameTemplateId)).thenReturn(listOf(scanToLog))
+        `when`(roundRepository.findAllBySessionIdOrderByRoundNumberAsc(sessionId)).thenReturn(rounds)
+        `when`(sessionRepository.save(any(NfcGameSession::class.java))).thenAnswer { invocation -> invocation.arguments[0] }
+
+        val result = service.handleCardScan(device, "teddy-card")
+
+        assertEquals("Teddy ist Platz 2 / 2 / 2.", result.timelineMessage)
     }
 
     @Test
@@ -342,7 +456,7 @@ class SessionStateMachineServiceTest {
         val awardNode = NfcFlowNode().apply {
             id = awardNodeId
             this.gameTemplateId = gameTemplateId
-            type = "AWARD_POINTS"
+            type = "CHANGE_VALUE"
             title = "Punkt vergeben"
             configJson = """{"points":1,"target":"scannedPlayer"}"""
             sortOrder = 2
@@ -410,12 +524,13 @@ class SessionStateMachineServiceTest {
         `when`(flowEdgeRepository.findAllByGameTemplateIdOrderByPriorityAsc(gameTemplateId)).thenReturn(listOf(scanToAward, oldAwardToCheck, awardToLog, logToWait))
         `when`(roundRepository.save(any(NfcSessionRound::class.java))).thenAnswer { invocation -> invocation.arguments[0] }
         `when`(sessionRepository.save(any(NfcGameSession::class.java))).thenAnswer { invocation -> invocation.arguments[0] }
+        stubNoStoredTeamPoints(sessionId, teamId)
 
         val result = service.handleCardScan(device, "teddy-card")
 
         assertEquals("Teddy hat 1 Nudeln bekommen.", result.timelineMessage)
         assertEquals(1, session.currentRoundNumber)
-        verify(roundRepository).save(any(NfcSessionRound::class.java))
+        verify(roundRepository, never()).saveAll(anyCollection<NfcSessionRound>())
     }
 
     @Test
@@ -495,7 +610,7 @@ class SessionStateMachineServiceTest {
         val awardNode = NfcFlowNode().apply {
             id = awardNodeId
             this.gameTemplateId = gameTemplateId
-            type = "AWARD_POINTS"
+            type = "CHANGE_VALUE"
             title = "Punkt vergeben"
             configJson = """{"points":1,"target":"scannedPlayer"}"""
             sortOrder = 4
@@ -565,6 +680,7 @@ class SessionStateMachineServiceTest {
         `when`(flowEdgeRepository.findAllByGameTemplateIdOrderByPriorityAsc(gameTemplateId)).thenReturn(listOf(unlimitedEdge, showToWait, scanToAward, awardToLog, logToWait))
         `when`(roundRepository.save(any(NfcSessionRound::class.java))).thenAnswer { invocation -> invocation.arguments[0] }
         `when`(sessionRepository.save(any(NfcGameSession::class.java))).thenAnswer { invocation -> invocation.arguments[0] }
+        stubNoStoredTeamPoints(sessionId, teamId)
 
         val menuResult = service.handleInput(sessionId, EventType.TOUCH_MENU_SELECT, mapOf("label" to "Unbegrenzt"))
 
@@ -575,7 +691,20 @@ class SessionStateMachineServiceTest {
 
         assertEquals("Teddy hat 1 Testssssss bekommen.", scanResult.timelineMessage)
         assertEquals(1, session.currentRoundNumber)
-        verify(roundRepository).save(any(NfcSessionRound::class.java))
+        verify(roundRepository, never()).saveAll(anyCollection<NfcSessionRound>())
+    }
+
+    private fun round(sessionId: UUID, winningTeamId: UUID, roundNumber: Int, points: Int): NfcSessionRound =
+        NfcSessionRound().apply {
+            this.sessionId = sessionId
+            this.winningTeamId = winningTeamId
+            this.roundNumber = roundNumber
+            awardedPointsPerMember = points
+        }
+
+    private fun stubNoStoredTeamPoints(sessionId: UUID, teamId: UUID) {
+        `when`(roundRepository.findAllBySessionIdOrderByRoundNumberAsc(sessionId)).thenReturn(emptyList())
+        `when`(valueRepository.findBySessionIdAndOwnerTypeAndOwnerIdAndValueKey(sessionId, OwnerType.TEAM, teamId, "points")).thenReturn(null)
     }
 
 }

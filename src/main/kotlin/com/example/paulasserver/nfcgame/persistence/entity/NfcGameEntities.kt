@@ -197,6 +197,13 @@ class NfcGameTemplate : NfcUuidEntity() {
     @Column(nullable = false)
     var winRuleType: WinRuleType = WinRuleType.FIRST_TO_WIN
 
+    @Column(nullable = false)
+    var globalWinnerPoints: Long = 5
+
+    var globalSecondPlacePoints: Long? = null
+
+    var globalThirdPlacePoints: Long? = null
+
     var dashboardMetricSource: String? = "points"
 
     var dashboardMetricLabel: String? = "Punkte"

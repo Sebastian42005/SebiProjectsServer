@@ -102,6 +102,8 @@ class NfcDeviceEventService(
                         "occurredAt" to request.occurredAt?.toString(),
                         "deviceStateKey" to request.currentStateKey,
                         "timelineMessage" to result.timelineMessage,
+                        "popupTitle" to result.popupTitle,
+                        "popupText" to result.popupText,
                     ),
                 )
             },
