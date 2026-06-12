@@ -214,6 +214,8 @@ class NfcGameTemplate : NfcUuidEntity() {
 
     var dashboardMetricDisplayType: String? = "RACE_BAR"
 
+    var dashboardMetricMaxSource: String? = null
+
     var dashboardStatusSource: String? = "currentRound"
 
     var dashboardStatusLabel: String? = "Runde"

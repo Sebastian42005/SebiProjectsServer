@@ -15,8 +15,10 @@ import com.example.paulasserver.nfcgame.application.session.SessionStateMachineS
 import com.example.paulasserver.nfcgame.domain.OwnerType
 import com.example.paulasserver.nfcgame.domain.SessionStatus
 import com.example.paulasserver.nfcgame.persistence.entity.NfcGameSession
+import com.example.paulasserver.nfcgame.persistence.entity.NfcGameTemplate
 import com.example.paulasserver.nfcgame.persistence.entity.NfcPlayerStatsProjection
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionRound
+import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionTeam
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionValue
 import com.example.paulasserver.nfcgame.persistence.repository.NfcGameResultRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcGameSessionRepository
@@ -214,6 +216,20 @@ class NfcPublicQueryService(
         val dashboardMetricConfig = dashboardMetricConfig(template)
         val rounds = roundRepository.findAllBySessionIdOrderByRoundNumberAsc(sessionId)
         val values = valueRepository.findAllBySessionId(sessionId)
+        val teams = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(sessionId)
+        val metricValuesByTeam = teams.associate { team ->
+            val teamId = requireNotNull(team.id)
+            val balance = values.firstOrNull { it.ownerType == OwnerType.TEAM && it.ownerId == teamId && it.valueKey == "money" }?.value
+                ?: accounts.firstOrNull { it.ownerType == OwnerType.TEAM && it.teamId == teamId }?.balance
+            teamId to dashboardMetricValue(dashboardMetricConfig.source, teamId, balance, rounds, values)
+        }
+        val rankedTeamIds = rankedTeamIds(teams, metricValuesByTeam, dashboardMetricConfig.sortDirection, result?.winningTeamId)
+        val placementRanks = rankedTeamIds.mapIndexed { index, teamId -> teamId to index + 1 }.toMap()
+        val placementPointsByTeam = placementPointAwards(template, result?.winningTeamId, rankedTeamIds)
+        val roundPointsByTeam = rounds
+            .mapNotNull { round -> round.winningTeamId?.let { it to round.awardedPointsPerMember.toLong() } }
+            .groupingBy { it.first }
+            .fold(0L) { sum, entry -> sum + entry.second }
 
         return SessionSummaryResponse(
             id = sessionId,
@@ -227,6 +243,10 @@ class NfcPublicQueryService(
             dashboardMetricSuffix = dashboardMetricConfig.suffix,
             dashboardMetricSortDirection = dashboardMetricConfig.sortDirection,
             dashboardMetricDisplayType = dashboardMetricConfig.displayType,
+            dashboardMetricMaxSource = dashboardMetricConfig.maxSource,
+            dashboardMetricMax = dashboardMetricConfig.maxSource
+                ?.let { dashboardMetricMaxValue(it, session, rounds, values, dashboardMetricConfig.sortDirection) }
+                ?.takeIf { it > BigDecimal.ZERO },
             dashboardStatusSource = dashboardMetricConfig.statusSource,
             dashboardStatusLabel = dashboardMetricConfig.statusLabel,
             dashboardStatusSuffix = dashboardMetricConfig.statusSuffix,
@@ -246,10 +266,12 @@ class NfcPublicQueryService(
             createdAt = session.createdAt,
             startedAt = session.startedAt,
             endedAt = session.endedAt,
-            teams = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(sessionId).map { team ->
+            teams = teams.map { team ->
                 val teamId = requireNotNull(team.id)
                 val balance = values.firstOrNull { it.ownerType == OwnerType.TEAM && it.ownerId == teamId && it.valueKey == "money" }?.value
                     ?: accounts.firstOrNull { it.ownerType == OwnerType.TEAM && it.teamId == teamId }?.balance
+                val roundGlobalPoints = roundPointsByTeam[teamId] ?: 0
+                val placementGlobalPoints = placementPointsByTeam[teamId] ?: 0
                 TeamResponse(
                     id = teamId,
                     name = team.name,
@@ -257,7 +279,11 @@ class NfcPublicQueryService(
                     targetSize = team.targetSize,
                     status = team.status,
                     balance = balance,
-                    dashboardMetricValue = dashboardMetricValue(dashboardMetricConfig.source, teamId, balance, rounds, values),
+                    dashboardMetricValue = metricValuesByTeam[teamId],
+                    placementRank = placementRanks[teamId],
+                    roundGlobalPointsAwarded = roundGlobalPoints,
+                    placementGlobalPointsAwarded = placementGlobalPoints,
+                    globalPointsAwarded = roundGlobalPoints + placementGlobalPoints,
                     members = memberRepository.findAllBySessionTeamId(teamId).map { member ->
                         val player = member.playerId?.let { playerRepository.findById(it).orElse(null) }
                         TeamMemberResponse(
@@ -307,6 +333,7 @@ class NfcPublicQueryService(
             sortDirection = template?.dashboardMetricSortDirection?.takeIf { it.equals("ASC", true) || it.equals("DESC", true) }?.uppercase()
                 ?: "DESC",
             displayType = template?.dashboardMetricDisplayType?.takeIf { it.isNotBlank() }?.uppercase() ?: "RACE_BAR",
+            maxSource = template?.dashboardMetricMaxSource?.trim()?.takeIf { it.isNotBlank() },
             statusSource = template?.dashboardStatusSource?.trim()?.takeIf { it.isNotBlank() } ?: if (template == null) "currentRound" else null,
             statusLabel = template?.dashboardStatusLabel?.trim() ?: "Runde",
             statusSuffix = template?.dashboardStatusSuffix?.takeIf { it.isNotBlank() },
@@ -363,6 +390,72 @@ class NfcPublicQueryService(
             )
         }
 
+    private fun dashboardMetricMaxValue(
+        source: String,
+        session: NfcGameSession,
+        rounds: List<NfcSessionRound>,
+        values: List<NfcSessionValue>,
+        sortDirection: String,
+    ): BigDecimal? {
+        source.trim().toBigDecimalOrNull()?.let { return it }
+        val contextValue = flowContext(session)[normalizeBuilderToken(source)]?.toBigDecimalOrNull()
+        if (contextValue != null) return contextValue
+        return dashboardStatusValue(source, session, rounds, values, sortDirection)
+    }
+
+    private fun flowContext(session: NfcGameSession): Map<String, String> =
+        session.currentStateKey
+            .split("|")
+            .drop(1)
+            .mapNotNull { token ->
+                val parts = token.split("=", limit = 2)
+                val key = parts.getOrNull(0)
+                val value = parts.getOrNull(1)
+                if (key != null && value != null && key !in setOf("sel", "num")) normalizeBuilderToken(key) to value else null
+            }
+            .toMap()
+
+    private fun normalizeBuilderToken(token: String): String =
+        token.trim().removePrefix("$").removePrefix("{").removeSuffix("}")
+
+    private fun rankedTeamIds(
+        teams: List<NfcSessionTeam>,
+        metricValuesByTeam: Map<UUID, BigDecimal>,
+        sortDirection: String,
+        winningTeamId: UUID?,
+    ): List<UUID> {
+        val byMetric = if (sortDirection.equals("ASC", ignoreCase = true)) {
+            compareBy<NfcSessionTeam> { metricValuesByTeam[it.id] ?: BigDecimal.ZERO }
+        } else {
+            compareByDescending<NfcSessionTeam> { metricValuesByTeam[it.id] ?: BigDecimal.ZERO }
+        }.thenBy { it.teamOrder }
+
+        val sortedTeams = teams.sortedWith(byMetric)
+        if (winningTeamId == null) return sortedTeams.mapNotNull { it.id }
+        val winner = teams.firstOrNull { it.id == winningTeamId }
+        return listOfNotNull(winner?.id) + sortedTeams.mapNotNull { it.id }.filter { it != winningTeamId }
+    }
+
+    private fun placementPointAwards(
+        template: NfcGameTemplate?,
+        winningTeamId: UUID?,
+        rankedTeamIds: List<UUID>,
+    ): Map<UUID, Long> {
+        if (winningTeamId == null) return emptyMap()
+        val awards = linkedMapOf<UUID, Long>()
+        val winnerPoints = template?.globalWinnerPoints ?: 5
+        if (winnerPoints > 0) awards[winningTeamId] = winnerPoints
+
+        val remaining = rankedTeamIds.filter { it != winningTeamId }
+        listOf(template?.globalSecondPlacePoints, template?.globalThirdPlacePoints)
+            .forEachIndexed { index, points ->
+                val teamId = remaining.getOrNull(index) ?: return@forEachIndexed
+                val positivePoints = points?.takeIf { it > 0 } ?: return@forEachIndexed
+                awards[teamId] = positivePoints
+            }
+        return awards
+    }
+
     private fun effectiveCurrentRoundNumber(session: NfcGameSession, rounds: List<NfcSessionRound>): Int {
         val maxRecordedRound = rounds.maxOfOrNull { it.roundNumber } ?: 0
         return if (maxRecordedRound > 0) maxRecordedRound else session.currentRoundNumber
@@ -381,6 +474,7 @@ class NfcPublicQueryService(
         val suffix: String? = null,
         val sortDirection: String = "DESC",
         val displayType: String = "RACE_BAR",
+        val maxSource: String? = null,
         val statusSource: String? = "currentRound",
         val statusLabel: String = "Runde",
         val statusSuffix: String? = null,

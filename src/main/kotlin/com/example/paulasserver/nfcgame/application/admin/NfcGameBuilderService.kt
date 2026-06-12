@@ -157,6 +157,7 @@ class NfcGameBuilderService(
                 dashboardMetricSuffix = source.dashboardMetricSuffix
                 dashboardMetricSortDirection = source.dashboardMetricSortDirection
                 dashboardMetricDisplayType = source.dashboardMetricDisplayType
+                dashboardMetricMaxSource = source.dashboardMetricMaxSource
                 dashboardStatusSource = source.dashboardStatusSource
                 dashboardStatusLabel = source.dashboardStatusLabel
                 dashboardStatusSuffix = source.dashboardStatusSuffix
@@ -409,6 +410,7 @@ class NfcGameBuilderService(
         dashboardMetricSuffix = request.dashboardMetricSuffix?.takeIf { it.isNotBlank() }
         dashboardMetricSortDirection = request.dashboardMetricSortDirection?.takeIf { it.equals("ASC", true) || it.equals("DESC", true) }?.uppercase() ?: "DESC"
         dashboardMetricDisplayType = request.dashboardMetricDisplayType?.takeIf { it.isNotBlank() }?.uppercase() ?: "RACE_BAR"
+        dashboardMetricMaxSource = request.dashboardMetricMaxSource?.trim()?.takeIf { it.isNotBlank() }
         dashboardStatusSource = request.dashboardStatusSource?.trim()?.takeIf { it.isNotBlank() }
         dashboardStatusLabel = request.dashboardStatusLabel?.trim() ?: "Runde"
         dashboardStatusSuffix = request.dashboardStatusSuffix?.takeIf { it.isNotBlank() }

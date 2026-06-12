@@ -74,6 +74,7 @@ class NfcGameMapper {
         dashboardMetricSuffix = template.dashboardMetricSuffix,
         dashboardMetricSortDirection = template.dashboardMetricSortDirection,
         dashboardMetricDisplayType = template.dashboardMetricDisplayType,
+        dashboardMetricMaxSource = template.dashboardMetricMaxSource,
         dashboardStatusSource = template.dashboardStatusSource,
         dashboardStatusLabel = template.dashboardStatusLabel,
         dashboardStatusSuffix = template.dashboardStatusSuffix,

@@ -1,6 +1,7 @@
 package com.example.paulasserver.nfcgame.persistence.repository
 
 import com.example.paulasserver.nfcgame.domain.CardStatus
+import com.example.paulasserver.nfcgame.domain.CardType
 import com.example.paulasserver.nfcgame.domain.GamePublicationStatus
 import com.example.paulasserver.nfcgame.domain.OwnerType
 import com.example.paulasserver.nfcgame.domain.SessionStatus
@@ -53,6 +54,11 @@ interface NfcCardRepository : JpaRepository<NfcCard, UUID> {
     fun findAllByStatusOrderByCreatedAtDesc(status: CardStatus): List<NfcCard>
     fun findAllByAccountIdOrderByCreatedAtDesc(accountId: Long): List<NfcCard>
     fun findAllByAccountIdAndStatusOrderByCreatedAtDesc(accountId: Long, status: CardStatus): List<NfcCard>
+    fun findAllByAccountIdAndCardTypeAndStatusOrderByCreatedAtDesc(
+        accountId: Long,
+        cardType: CardType,
+        status: CardStatus,
+    ): List<NfcCard>
     fun findFirstByGameTemplateIdAndStatus(gameTemplateId: UUID, status: CardStatus): NfcCard?
     fun deleteAllByAccountId(accountId: Long)
 }

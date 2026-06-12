@@ -4,11 +4,13 @@ import com.example.paulasserver.nfcgame.api.dto.DeviceEventRequest
 import com.example.paulasserver.nfcgame.api.dto.DeviceEventResponse
 import com.example.paulasserver.nfcgame.api.dto.DeviceProvisioningResponse
 import com.example.paulasserver.nfcgame.api.dto.DeviceRequest
+import com.example.paulasserver.nfcgame.api.dto.DeviceUiHints
 import com.example.paulasserver.nfcgame.api.dto.MoneyTransferRequest
 import com.example.paulasserver.nfcgame.api.dto.ScreenModel
 import com.example.paulasserver.nfcgame.application.NfcGameMapper
 import com.example.paulasserver.nfcgame.application.publicapi.NfcPublicQueryService
 import com.example.paulasserver.nfcgame.application.session.SessionStateMachineService
+import com.example.paulasserver.nfcgame.domain.CardStatus
 import com.example.paulasserver.nfcgame.domain.CardType
 import com.example.paulasserver.nfcgame.domain.EventType
 import com.example.paulasserver.nfcgame.domain.ScreenType
@@ -23,6 +25,8 @@ import com.example.paulasserver.nfcgame.persistence.repository.NfcMoneyTransacti
 import com.example.paulasserver.nfcgame.persistence.repository.NfcPlayerRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionAccountRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionEventRepository
+import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionTeamMemberRepository
+import com.example.paulasserver.nfcgame.persistence.repository.NfcSessionTeamRepository
 import com.example.paulasserver.nfcgame.security.DeviceAuthenticator
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.springframework.http.HttpStatus
@@ -45,6 +49,8 @@ class NfcDeviceEventService(
     private val deviceRepository: NfcDeviceRepository,
     private val sessionRepository: NfcGameSessionRepository,
     private val playerRepository: NfcPlayerRepository,
+    private val teamRepository: NfcSessionTeamRepository,
+    private val memberRepository: NfcSessionTeamMemberRepository,
     private val publicQueryService: NfcPublicQueryService,
     private val messagingTemplate: SimpMessagingTemplate,
     private val mapper: NfcGameMapper,
@@ -125,6 +131,7 @@ class NfcDeviceEventService(
             errors = result.errors,
             scannedCardType = scanFeedback?.cardType,
             scannedPlayerName = scanFeedback?.playerName,
+            uiHints = buildUiHints(device, result.session?.id),
         )
     }
 
@@ -144,6 +151,7 @@ class NfcDeviceEventService(
             screen = result.screen,
             effects = result.effects,
             errors = result.errors,
+            uiHints = buildUiHints(device, result.session?.id),
         )
     }
 
@@ -257,6 +265,64 @@ class NfcDeviceEventService(
         val cardType: CardType,
         val playerName: String? = null,
     )
+
+    private fun buildUiHints(device: NfcDevice, sessionId: java.util.UUID?): DeviceUiHints {
+        val accountId = device.accountId
+        return DeviceUiHints(
+            predictions = sessionId?.let { stateMachineService.previewUiPredictions(it) }.orEmpty(),
+            allowedPlayerCardUids = allowedPlayerCardUids(accountId, sessionId),
+            allowedGameCardUids = allowedGameCardUids(accountId, sessionId),
+        )
+    }
+
+    private fun allowedPlayerCardUids(accountId: Long?, sessionId: java.util.UUID?): List<String> {
+        val playerCards = assignedAccountCards(accountId, CardType.PLAYER)
+            .filter { card ->
+                val playerId = card.playerId ?: return@filter false
+                playerRepository.findById(playerId).orElse(null)?.active == true
+            }
+        val session = sessionId?.let { sessionRepository.findById(it).orElse(null) }
+        if (session?.status != SessionStatus.RUNNING) {
+            return playerCards.map { it.cardUid }.distinct()
+        }
+
+        val teamIds = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(sessionId).mapNotNull { it.id }
+        if (teamIds.isEmpty()) {
+            return emptyList()
+        }
+        val sessionPlayerIds = teamIds
+            .flatMap { memberRepository.findAllBySessionTeamId(it) }
+            .mapNotNull { it.playerId }
+            .toSet()
+
+        return playerCards
+            .filter { it.playerId in sessionPlayerIds }
+            .map { it.cardUid }
+            .distinct()
+    }
+
+    private fun allowedGameCardUids(accountId: Long?, sessionId: java.util.UUID?): List<String> {
+        val gameCards = assignedAccountCards(accountId, CardType.GAME)
+        val gameTemplateId = sessionId
+            ?.let { sessionRepository.findById(it).orElse(null) }
+            ?.gameTemplateId
+        return gameCards
+            .filter { gameTemplateId == null || it.gameTemplateId == gameTemplateId }
+            .map { it.cardUid }
+            .filter { it.isNotBlank() }
+            .distinct()
+    }
+
+    private fun assignedAccountCards(accountId: Long?, cardType: CardType) =
+        accountId
+            ?.let {
+                cardRepository.findAllByAccountIdAndCardTypeAndStatusOrderByCreatedAtDesc(
+                    it,
+                    cardType,
+                    CardStatus.ASSIGNED,
+                )
+            }
+            .orEmpty()
 
     private fun resolveScanFeedback(cardUid: String?): ScanFeedback? {
         val normalizedUid = cardUid?.trim()?.uppercase()?.takeIf { it.isNotBlank() } ?: return null

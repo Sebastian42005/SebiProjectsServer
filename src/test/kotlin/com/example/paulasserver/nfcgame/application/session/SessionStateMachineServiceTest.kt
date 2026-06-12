@@ -10,6 +10,7 @@ import com.example.paulasserver.nfcgame.persistence.entity.NfcCard
 import com.example.paulasserver.nfcgame.persistence.entity.NfcDevice
 import com.example.paulasserver.nfcgame.persistence.entity.NfcFlowEdge
 import com.example.paulasserver.nfcgame.persistence.entity.NfcFlowNode
+import com.example.paulasserver.nfcgame.persistence.entity.NfcGameResult
 import com.example.paulasserver.nfcgame.persistence.entity.NfcGameSession
 import com.example.paulasserver.nfcgame.persistence.entity.NfcGameTemplate
 import com.example.paulasserver.nfcgame.persistence.entity.NfcPlayer
@@ -692,6 +693,163 @@ class SessionStateMachineServiceTest {
         assertEquals("Teddy hat 1 Testssssss bekommen.", scanResult.timelineMessage)
         assertEquals(1, session.currentRoundNumber)
         verify(roundRepository, never()).saveAll(anyCollection<NfcSessionRound>())
+    }
+
+    @Test
+    fun `game card scan at wait game card follows the builder edge instead of ending immediately`() {
+        val accountId = 42L
+        val deviceId = UUID.randomUUID()
+        val gameTemplateId = UUID.randomUUID()
+        val sessionId = UUID.randomUUID()
+        val waitGameNodeId = UUID.randomUUID()
+        val waitPlayerNodeId = UUID.randomUUID()
+
+        val device = NfcDevice().apply {
+            id = deviceId
+            this.accountId = accountId
+        }
+        val template = NfcGameTemplate().apply {
+            id = gameTemplateId
+            active = true
+        }
+        val session = NfcGameSession().apply {
+            id = sessionId
+            this.accountId = accountId
+            this.gameTemplateId = gameTemplateId
+            this.deviceId = deviceId
+            status = SessionStatus.RUNNING
+            currentStateKey = waitGameNodeId.toString()
+        }
+        val gameCard = NfcCard().apply {
+            cardUid = "GAME-CARD"
+            cardType = CardType.GAME
+            status = CardStatus.ASSIGNED
+            this.gameTemplateId = gameTemplateId
+            this.accountId = accountId
+        }
+        val waitGameNode = NfcFlowNode().apply {
+            id = waitGameNodeId
+            this.gameTemplateId = gameTemplateId
+            type = "WAIT_GAME_CARD"
+            title = "Spielkarte scannen"
+            configJson = "{}"
+        }
+        val waitPlayerNode = NfcFlowNode().apply {
+            id = waitPlayerNodeId
+            this.gameTemplateId = gameTemplateId
+            type = "WAIT_PLAYER_CARD"
+            title = "Danach Spielerkarte"
+            configJson = "{}"
+        }
+        val gameToPlayer = NfcFlowEdge().apply {
+            id = UUID.randomUUID()
+            this.gameTemplateId = gameTemplateId
+            sourceNodeId = waitGameNodeId
+            targetNodeId = waitPlayerNodeId
+            eventType = "GAME_CARD_SCANNED"
+            priority = 1
+        }
+
+        `when`(cardRepository.findByCardUid("GAME-CARD")).thenReturn(gameCard)
+        `when`(gameTemplateRepository.findById(gameTemplateId)).thenReturn(Optional.of(template))
+        `when`(sessionRepository.findAllByAccountIdAndStatusInOrderByCreatedAtDesc(accountId, listOf(SessionStatus.LOBBY, SessionStatus.CONFIGURING, SessionStatus.BUILDING_TEAMS, SessionStatus.READY, SessionStatus.RUNNING))).thenReturn(listOf(session))
+        `when`(flowNodeRepository.findById(waitGameNodeId)).thenReturn(Optional.of(waitGameNode))
+        `when`(flowNodeRepository.findById(waitPlayerNodeId)).thenReturn(Optional.of(waitPlayerNode))
+        `when`(flowEdgeRepository.findAllByGameTemplateIdOrderByPriorityAsc(gameTemplateId)).thenReturn(listOf(gameToPlayer))
+        `when`(sessionRepository.save(any(NfcGameSession::class.java))).thenAnswer { invocation -> invocation.arguments[0] }
+
+        val result = service.handleCardScan(device, "game-card")
+
+        assertEquals(SessionStatus.RUNNING, session.status)
+        assertTrue(session.currentStateKey.startsWith(waitPlayerNodeId.toString()))
+        assertEquals("Danach Spielerkarte", result.screen.title)
+        verify(resultRepository, never()).save(any(NfcGameResult::class.java))
+    }
+
+    @Test
+    fun `wait any card can branch on player card and store the scanned player`() {
+        val accountId = 42L
+        val deviceId = UUID.randomUUID()
+        val gameTemplateId = UUID.randomUUID()
+        val sessionId = UUID.randomUUID()
+        val playerId = UUID.randomUUID()
+        val teamId = UUID.randomUUID()
+        val waitAnyNodeId = UUID.randomUUID()
+        val logNodeId = UUID.randomUUID()
+
+        val device = NfcDevice().apply {
+            id = deviceId
+            this.accountId = accountId
+        }
+        val session = NfcGameSession().apply {
+            id = sessionId
+            this.accountId = accountId
+            this.gameTemplateId = gameTemplateId
+            this.deviceId = deviceId
+            status = SessionStatus.RUNNING
+            currentStateKey = waitAnyNodeId.toString()
+        }
+        val card = NfcCard().apply {
+            cardUid = "TEDDY-CARD"
+            cardType = CardType.PLAYER
+            status = CardStatus.ASSIGNED
+            this.playerId = playerId
+            this.accountId = accountId
+        }
+        val player = NfcPlayer().apply {
+            id = playerId
+            name = "Teddy"
+            active = true
+            this.accountId = accountId
+        }
+        val team = NfcSessionTeam().apply {
+            id = teamId
+            this.sessionId = sessionId
+            name = "Team 1"
+            teamOrder = 1
+        }
+        val member = NfcSessionTeamMember().apply {
+            id = UUID.randomUUID()
+            sessionTeamId = teamId
+            this.playerId = playerId
+        }
+        val waitAnyNode = NfcFlowNode().apply {
+            id = waitAnyNodeId
+            this.gameTemplateId = gameTemplateId
+            type = "WAIT_ANY_CARD"
+            title = "Beliebige Karte"
+            configJson = """{"storeAs":"pickedPlayer"}"""
+        }
+        val logNode = NfcFlowNode().apply {
+            id = logNodeId
+            this.gameTemplateId = gameTemplateId
+            type = "LOG_EVENT"
+            title = "Timeline schreiben"
+            configJson = """{"template":"${'$'}pickedPlayer.name wurde gescannt."}"""
+        }
+        val playerToLog = NfcFlowEdge().apply {
+            id = UUID.randomUUID()
+            this.gameTemplateId = gameTemplateId
+            sourceNodeId = waitAnyNodeId
+            targetNodeId = logNodeId
+            eventType = "PLAYER_CARD_SCANNED"
+            priority = 1
+        }
+
+        `when`(cardRepository.findByCardUid("TEDDY-CARD")).thenReturn(card)
+        `when`(sessionRepository.findFirstByAccountIdAndStatusInOrderByCreatedAtDesc(accountId, listOf(SessionStatus.LOBBY, SessionStatus.CONFIGURING, SessionStatus.BUILDING_TEAMS, SessionStatus.READY, SessionStatus.RUNNING))).thenReturn(session)
+        `when`(playerRepository.findById(playerId)).thenReturn(Optional.of(player))
+        `when`(teamRepository.findById(teamId)).thenReturn(Optional.of(team))
+        `when`(teamRepository.findAllBySessionIdOrderByTeamOrderAsc(sessionId)).thenReturn(listOf(team))
+        `when`(memberRepository.findByPlayerIdAndSessionTeamIdIn(playerId, listOf(teamId))).thenReturn(member)
+        `when`(flowNodeRepository.findById(waitAnyNodeId)).thenReturn(Optional.of(waitAnyNode))
+        `when`(flowNodeRepository.findById(logNodeId)).thenReturn(Optional.of(logNode))
+        `when`(flowEdgeRepository.findAllByGameTemplateIdOrderByPriorityAsc(gameTemplateId)).thenReturn(listOf(playerToLog))
+        `when`(sessionRepository.save(any(NfcGameSession::class.java))).thenAnswer { invocation -> invocation.arguments[0] }
+
+        val result = service.handleCardScan(device, "teddy-card")
+
+        assertEquals("Teddy wurde gescannt.", result.timelineMessage)
     }
 
     private fun round(sessionId: UUID, winningTeamId: UUID, roundNumber: Int, points: Int): NfcSessionRound =

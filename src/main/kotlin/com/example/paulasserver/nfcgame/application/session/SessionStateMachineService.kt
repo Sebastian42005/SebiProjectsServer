@@ -1,5 +1,6 @@
 package com.example.paulasserver.nfcgame.application.session
 
+import com.example.paulasserver.nfcgame.api.dto.DeviceUiPrediction
 import com.example.paulasserver.nfcgame.api.dto.MenuItem
 import com.example.paulasserver.nfcgame.api.dto.ScreenModel
 import com.example.paulasserver.nfcgame.application.statistics.NfcStatisticsService
@@ -45,6 +46,7 @@ import java.math.BigDecimal
 import java.math.MathContext
 import java.time.Instant
 import java.util.UUID
+import kotlin.random.Random
 
 data class StateMachineResult(
     val session: NfcGameSession?,
@@ -157,6 +159,28 @@ class SessionStateMachineService(
         return StateMachineResult(session = session, screen = buildScreen(session))
     }
 
+    fun previewUiPredictions(sessionId: UUID): List<DeviceUiPrediction> {
+        val session = sessionRepository.findById(sessionId).orElse(null) ?: return emptyList()
+        val node = currentFlowNode(session) ?: return emptyList()
+        return when (node.type) {
+            "MENU" -> previewMenuPredictions(session, node)
+            "WAIT_PLAYER_CARD", "WAIT_GAME_CARD" -> previewMenuPredictions(session, node)
+            "NUMBER_PICKER" -> previewSingleNextPrediction(
+                session = session,
+                node = node,
+                eventType = EventType.TOUCH_NUMBER_SET,
+                edgeEventType = "VALUE_CONFIRMED",
+            )
+
+            else -> previewSingleNextPrediction(
+                session = session,
+                node = node,
+                eventType = EventType.TOUCH_CONFIRM,
+                edgeEventType = "NEXT",
+            )
+        }.take(MAX_DEVICE_UI_PREDICTIONS)
+    }
+
     fun handleInput(sessionId: UUID, eventType: EventType, payload: Map<String, Any?> = emptyMap()): StateMachineResult {
         val session = sessionRepository.findById(sessionId).orElseThrow {
             ResponseStatusException(HttpStatus.NOT_FOUND, "Session not found")
@@ -182,7 +206,7 @@ class SessionStateMachineService(
         if (node.type == "NUMBER_PICKER" && (isConfirmEvent(eventType) || eventType == EventType.TOUCH_NUMBER_SET)) {
             applyNumberPickerValue(session, node)
         }
-        if (node.type == "MENU" && (isConfirmEvent(eventType) || eventType == EventType.TOUCH_MENU_SELECT)) {
+        if (isMenuInputNode(node) && (isConfirmEvent(eventType) || eventType == EventType.TOUCH_MENU_SELECT)) {
             applyMenuSelection(session, node, payload)
         }
         val next = nextNodeForInput(session, node, eventType, payload) ?: return StateMachineResult(session = session, screen = buildScreen(session))
@@ -284,6 +308,10 @@ class SessionStateMachineService(
         }
 
         if (activeSession.status == SessionStatus.RUNNING) {
+            val node = currentFlowNode(activeSession)
+            if (node != null && node.type in setOf("WAIT_GAME_CARD", "WAIT_ANY_CARD")) {
+                return handleRunningGameScan(activeSession, node)
+            }
             val teams = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(activeSession.id))
             val winner = calculateConfiguredWinner(activeSession, teams)
             finishSession(activeSession, winner, "GAME_CARD_ENDED", teams.mapNotNull { it.id })
@@ -469,7 +497,7 @@ class SessionStateMachineService(
         val currentNode = currentFlowNode(session) ?: implicitRuntimePlayerWaitNode(session)
         val nextNodeId = currentNode
             ?.takeIf { it.type in setOf("WAIT_PLAYER_CARD", "WAIT_ANY_CARD") }
-            ?.let { nextNodeByEvent(it, "CARD_SCANNED") ?: nextNodeByEvent(it, "NEXT") }
+            ?.let { nextNodeForCardScan(it, CardType.PLAYER) }
         if (nextNodeId != null) {
             return continueRunningFlowAfterPlayerScan(session, teams, playerId, winningTeamId, nextNodeId)
         }
@@ -495,7 +523,7 @@ class SessionStateMachineService(
         val teams = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
         val membership = memberRepository.findByPlayerIdAndSessionTeamIdIn(playerId, teams.mapNotNull { it.id })
             ?: return error("Spieler nicht im Spiel", "Dieser Spieler gehoert zu keinem Team in der Session.")
-        val nextNodeId = nextNodeByEvent(node, "CARD_SCANNED") ?: nextNodeByEvent(node, "NEXT")
+        val nextNodeId = nextNodeForCardScan(node, CardType.PLAYER)
         if (nextNodeId == null) {
             return recordWinFromPlayerCard(session, playerId)
         }
@@ -506,6 +534,12 @@ class SessionStateMachineService(
             "lastScannedTeam" to requireNotNull(membership.sessionTeamId).toString(),
         ) + scanStoreContext(node, playerId, requireNotNull(membership.sessionTeamId))
         return enterRunningFlowNode(session, nextNodeId, context, listOf("BEEP_SUCCESS"))
+    }
+
+    private fun handleRunningGameScan(session: NfcGameSession, node: NfcFlowNode): StateMachineResult {
+        val nextNodeId = nextNodeForCardScan(node, CardType.GAME)
+            ?: return StateMachineResult(session = session, screen = buildScreen(session), effects = listOf("BEEP_INFO"))
+        return enterRunningFlowNode(session, nextNodeId, flowContext(session), listOf("BEEP_SUCCESS"))
     }
 
     private fun scanStoreContext(node: NfcFlowNode, playerId: UUID, teamId: UUID): Map<String, String> {
@@ -562,6 +596,11 @@ class SessionStateMachineService(
 
                 "CALCULATE" -> {
                     runtimeContext = runtimeContext + calculateFlowValue(session, node, readMap(node.configJson), runtimeContext)
+                    nodeId = nextNodeByEvent(node, "NEXT")
+                }
+
+                "RANDOMIZER" -> {
+                    runtimeContext = runtimeContext + randomizeFlowValue(session, readMap(node.configJson))
                     nodeId = nextNodeByEvent(node, "NEXT")
                 }
 
@@ -700,7 +739,7 @@ class SessionStateMachineService(
         ArithmeticExpressionParser(expression) { token -> numericValueForToken(session, token, context) }.parse()
 
     private fun numericValueForToken(session: NfcGameSession, token: String, context: Map<String, String>): BigDecimal? {
-        val key = token.trim().removePrefix("{").removeSuffix("}")
+        val key = normalizeBuilderToken(token)
         context[key]?.toBigDecimalOrNull()?.let { return it }
         when (key) {
             "currentRound", "round", "currentRoundNumber" -> return effectiveCurrentRoundNumber(session).toBigDecimal()
@@ -727,11 +766,58 @@ class SessionStateMachineService(
             ?: config["formula"]?.toString()?.takeIf { it.isNotBlank() }
             ?: return emptyMap()
         val value = numericValueForExpression(session, expression, context) ?: return emptyMap()
-        return mapOf(target.trim().removePrefix("{").removeSuffix("}") to value.stripTrailingZeros().toPlainString())
+        return mapOf(normalizeBuilderToken(target) to value.stripTrailingZeros().toPlainString())
+    }
+
+    private fun randomizeFlowValue(session: NfcGameSession, config: Map<String, Any?>): Map<String, String> {
+        val target = config["storeAs"]?.toString()?.takeIf { it.isNotBlank() }
+            ?: config["variableName"]?.toString()?.takeIf { it.isNotBlank() }
+            ?: config["targetVariable"]?.toString()?.takeIf { it.isNotBlank() && it != "custom" }
+            ?: return emptyMap()
+        val key = normalizeBuilderToken(target)
+        return when (config["mode"]?.toString()?.uppercase()) {
+            "TEAM", "PLAYER" -> {
+                val teams = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
+                    .mapNotNull { team -> team.id?.let { it to team.name } }
+                val randomTeam = teams.randomOrNull() ?: return emptyMap()
+                mapOf(
+                    key to randomTeam.first.toString(),
+                    "${key}Team" to randomTeam.first.toString(),
+                    "${key}Name" to randomTeam.second,
+                )
+            }
+
+            "TEXT", "STRING" -> {
+                val options = randomTextOptions(config)
+                mapOf(key to (options.randomOrNull() ?: ""))
+            }
+
+            else -> {
+                val rawMin = intConfig(config, "min") ?: 1
+                val rawMax = intConfig(config, "max") ?: rawMin
+                val min = minOf(rawMin, rawMax)
+                val max = maxOf(rawMin, rawMax)
+                mapOf(key to Random.nextInt(min, max + 1).toString())
+            }
+        }
+    }
+
+    private fun randomTextOptions(config: Map<String, Any?>): List<String> {
+        val raw = config["textOptions"]
+            ?: config["optionsText"]
+            ?: config["values"]
+            ?: config["options"]
+        return when (raw) {
+            is List<*> -> raw.mapNotNull { it?.toString()?.trim()?.takeIf(String::isNotBlank) }
+            else -> raw?.toString()
+                ?.split(',')
+                ?.mapNotNull { it.trim().takeIf(String::isNotBlank) }
+                .orEmpty()
+        }
     }
 
     private fun displayValueForExpression(session: NfcGameSession, expression: String, context: Map<String, String>): String? {
-        val key = expression.trim().removePrefix("{").removeSuffix("}")
+        val key = normalizeBuilderToken(expression)
         val parts = key.split('.', limit = 2)
         if (parts.size != 2) {
             return context[key]?.let { displayValueForVariable(session, key, it) }
@@ -878,13 +964,18 @@ class SessionStateMachineService(
         accountRepository.save(account)
     }
 
-    private fun normalizeValueKey(valueKey: String): String =
-        when (valueKey.trim().removePrefix("{").removeSuffix("}").lowercase()) {
+    private fun normalizeBuilderToken(token: String): String =
+        token.trim().removePrefix("{").removeSuffix("}").removePrefix("$")
+
+    private fun normalizeValueKey(valueKey: String): String {
+        val normalized = normalizeBuilderToken(valueKey).lowercase()
+        return when (normalized) {
             "score", "punkt", "punkte" -> "points"
             "balance", "kontostand", "geld" -> "money"
             "rank", "rang", "position", "place", "platz", "platzierung" -> "placement"
-            else -> valueKey.trim().removePrefix("{").removeSuffix("}").lowercase()
+            else -> normalized
         }
+    }
 
     private data class TeamPlacement(val teamId: UUID, val value: BigDecimal, val teamOrder: Int, val name: String)
 
@@ -930,6 +1021,11 @@ class SessionStateMachineService(
     private fun teamIdForBuilderReferenceWithoutAccountLookup(session: NfcGameSession, reference: String, context: Map<String, String>): UUID? {
         context["${reference}Team"]?.let { value -> runCatching { UUID.fromString(value) }.getOrNull()?.let { return it } }
         val directTeamValue = context[reference]?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+        directTeamValue
+            ?.let { teamRepository.findById(it).orElse(null) }
+            ?.takeIf { it.sessionId == session.id }
+            ?.id
+            ?.let { return it }
         if (reference in setOf("team", "scannedTeam", "lastScannedTeam", "lastAwardedTeam", "winner")) {
             directTeamValue?.let { return it }
         }
@@ -954,9 +1050,7 @@ class SessionStateMachineService(
     ): UUID? {
         val target = (config["targetVariable"]?.toString()?.takeIf { it.isNotBlank() }
             ?: config["target"]?.toString()?.takeIf { it.isNotBlank() })
-            ?.trim()
-            ?.removePrefix("{")
-            ?.removeSuffix("}")
+            ?.let(::normalizeBuilderToken)
             ?: "team"
         context["${target}Team"]?.let { return runCatching { UUID.fromString(it) }.getOrNull() }
         if (target.contains('.')) {
@@ -982,9 +1076,7 @@ class SessionStateMachineService(
     ): List<UUID> {
         val target = (config["targetVariable"]?.toString()?.takeIf { it.isNotBlank() }
             ?: config["target"]?.toString()?.takeIf { it.isNotBlank() })
-            ?.trim()
-            ?.removePrefix("{")
-            ?.removeSuffix("}")
+            ?.let(::normalizeBuilderToken)
             ?: "team"
         if (target in setOf("allTeams", "allPlayers", "everyone")) {
             return teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id)).mapNotNull { it.id }
@@ -999,9 +1091,7 @@ class SessionStateMachineService(
     ): List<ValueOwner> {
         val target = (config["targetVariable"]?.toString()?.takeIf { it.isNotBlank() }
             ?: config["target"]?.toString()?.takeIf { it.isNotBlank() })
-            ?.trim()
-            ?.removePrefix("{")
-            ?.removeSuffix("}")
+            ?.let(::normalizeBuilderToken)
             ?: "team"
         if (target in setOf("allTeams", "allPlayers", "everyone")) {
             return teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
@@ -1124,7 +1214,7 @@ class SessionStateMachineService(
     }
 
     private fun evaluateNumericCondition(session: NfcGameSession, expression: String, context: Map<String, String>): Boolean? {
-        val match = Regex("""^\s*([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?)\s*(<=|>=|==|!=|<|>)\s*(-?\d+(?:\.\d+)?|[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?)\s*$""")
+        val match = Regex("""^\s*(\$?[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?)\s*(<=|>=|==|!=|<|>)\s*(-?\d+(?:\.\d+)?|\$?[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?|null)\s*$""")
             .matchEntire(expression)
             ?: return null
         val left = numericValueForExpression(session, match.groupValues[1], context) ?: return false
@@ -1283,13 +1373,17 @@ class SessionStateMachineService(
             ?: nodes.firstOrNull { it.type == "LOG_EVENT" }?.let { readMap(it.configJson)["template"]?.toString() }
             ?: nodes.firstOrNull { it.type == "MONEY_TRANSFER" }?.let { readMap(it.configJson)["timelineTemplate"]?.toString() }
             ?: "Timeline Ereignis gespeichert."
-        return extraPlaceholders.entries.fold(
+        return extraPlaceholders.entries.sortedByDescending { it.key.length }.fold(
             template
             .replace("{payer}", payer)
+            .replace("\$payer", payer)
             .replace("{target}", target)
+            .replace("\$target", target)
             .replace("{amount}", amount.toString())
-                .replace("{currency}", currency),
-        ) { message, (key, value) -> message.replace("{$key}", value) }
+            .replace("\$amount", amount.toString())
+            .replace("{currency}", currency)
+            .replace("\$currency", currency),
+        ) { message, (key, value) -> message.replace("{$key}", value).replace("$" + key, value) }
     }
 
     private fun finishSession(
@@ -1518,12 +1612,7 @@ class SessionStateMachineService(
                 )
             }
 
-            "WAIT_PLAYER_CARD", "WAIT_ANY_CARD", "WAIT_GAME_CARD" -> ScreenModel(
-                screenType = ScreenType.WAITING_FOR_SCAN,
-                title = title,
-                subtitle = text,
-                context = mapOf("sessionStatus" to session.status.name, "nodeType" to node.type),
-            )
+            "WAIT_PLAYER_CARD", "WAIT_ANY_CARD", "WAIT_GAME_CARD" -> waitCardScreen(session, node, title, text)
 
             else -> ScreenModel(
                 screenType = ScreenType.MESSAGE,
@@ -1534,6 +1623,135 @@ class SessionStateMachineService(
                     "nodeType" to node.type,
                     "continueMode" to (config["continueMode"]?.toString() ?: "AUTO"),
                 ),
+            )
+        }
+    }
+
+    private fun previewMenuPredictions(session: NfcGameSession, node: NfcFlowNode): List<DeviceUiPrediction> {
+        val items = menuItemsForNode(session, node)
+        return items.mapIndexedNotNull { index, item ->
+            val payload = mapOf(
+                "index" to index,
+                "value" to item.value,
+                "label" to item.label,
+            )
+            val nextNodeId = nextNodeForInput(session, node, EventType.TOUCH_MENU_SELECT, payload) ?: return@mapIndexedNotNull null
+            val targetNode = flowNodeRepository.findById(nextNodeId).orElse(null) ?: return@mapIndexedNotNull null
+            val targetStateKey = flowStateKey(targetNode)
+            DeviceUiPrediction(
+                eventType = EventType.TOUCH_MENU_SELECT,
+                match = mapOf(
+                    "index" to index,
+                    "value" to item.value,
+                    "label" to item.label,
+                ),
+                currentStateKey = targetStateKey,
+                status = session.status,
+                screen = buildFlowPreviewScreenForNode(session, targetNode),
+            )
+        }
+    }
+
+    private fun previewSingleNextPrediction(
+        session: NfcGameSession,
+        node: NfcFlowNode,
+        eventType: EventType,
+        edgeEventType: String,
+    ): List<DeviceUiPrediction> {
+        val nextNodeId = nextNodeByEvent(node, edgeEventType) ?: return emptyList()
+        val targetNode = flowNodeRepository.findById(nextNodeId).orElse(null) ?: return emptyList()
+        return listOf(
+            DeviceUiPrediction(
+                eventType = eventType,
+                currentStateKey = flowStateKey(targetNode),
+                status = session.status,
+                screen = buildFlowPreviewScreenForNode(session, targetNode),
+            ),
+        )
+    }
+
+    private fun buildFlowPreviewScreenForNode(session: NfcGameSession, node: NfcFlowNode): ScreenModel {
+        val config = readMap(node.configJson)
+        val context = flowContext(session)
+        val title = renderBuilderTemplate(session, node.title, context) ?: node.title
+        val text = renderBuilderTemplate(session, config["text"]?.toString(), context)
+        return when (node.type) {
+            "START" -> {
+                val nextNode = nextNodeByEvent(node, "NEXT")
+                    ?.let { flowNodeRepository.findById(it).orElse(null) }
+                if (nextNode != null) {
+                    buildFlowPreviewScreenForNode(session, nextNode)
+                } else {
+                    ScreenModel(ScreenType.MESSAGE, title, text, context = mapOf("sessionStatus" to session.status.name))
+                }
+            }
+
+            "MENU" -> {
+                val items = menuItemsForNode(session, node)
+                ScreenModel(
+                    screenType = ScreenType.MENU,
+                    title = title,
+                    subtitle = text,
+                    menuItems = items,
+                    selectedIndex = currentSelectedIndex(session, items.size),
+                    context = mapOf("sessionStatus" to session.status.name, "nodeType" to node.type),
+                )
+            }
+
+            "NUMBER_PICKER" -> {
+                val min = intConfig(config, "min") ?: 1
+                val max = intConfig(config, "max") ?: 99
+                val smallStep = intConfig(config, "smallStep") ?: intConfig(config, "step") ?: 1
+                val largeStep = intConfig(config, "largeStep") ?: smallStep
+                ScreenModel(
+                    screenType = ScreenType.NUMBER_PICKER,
+                    title = title,
+                    subtitle = text,
+                    lines = listOf("Touch: Wert setzen"),
+                    numberValue = currentNumberValue(session, node),
+                    context = mapOf(
+                        "sessionStatus" to session.status.name,
+                        "nodeType" to node.type,
+                        "min" to min,
+                        "max" to max,
+                        "numberSmallStep" to smallStep,
+                        "numberLargeStep" to largeStep,
+                    ),
+                )
+            }
+
+            "WAIT_PLAYER_CARD", "WAIT_ANY_CARD", "WAIT_GAME_CARD" -> waitCardScreen(session, node, title, text)
+
+            else -> ScreenModel(
+                screenType = ScreenType.MESSAGE,
+                title = title,
+                subtitle = text,
+                context = mapOf(
+                    "sessionStatus" to session.status.name,
+                    "nodeType" to node.type,
+                    "continueMode" to (config["continueMode"]?.toString() ?: "AUTO"),
+                ),
+            )
+        }
+    }
+
+    private fun waitCardScreen(session: NfcGameSession, node: NfcFlowNode, title: String, text: String?): ScreenModel {
+        val items = if (node.type in setOf("WAIT_PLAYER_CARD", "WAIT_GAME_CARD")) menuItemsForNode(session, node) else emptyList()
+        return if (items.isNotEmpty()) {
+            ScreenModel(
+                screenType = ScreenType.MENU,
+                title = title,
+                subtitle = text,
+                menuItems = items,
+                selectedIndex = currentSelectedIndex(session, items.size),
+                context = mapOf("sessionStatus" to session.status.name, "nodeType" to node.type),
+            )
+        } else {
+            ScreenModel(
+                screenType = ScreenType.WAITING_FOR_SCAN,
+                title = title,
+                subtitle = text,
+                context = mapOf("sessionStatus" to session.status.name, "nodeType" to node.type),
             )
         }
     }
@@ -1692,7 +1910,7 @@ class SessionStateMachineService(
 
     private fun nextNodeForInput(session: NfcGameSession, node: NfcFlowNode, eventType: EventType, payload: Map<String, Any?>): UUID? =
         when (node.type) {
-            "MENU" -> {
+            "MENU", "WAIT_PLAYER_CARD", "WAIT_GAME_CARD" -> {
                 val edges = flowEdgeRepository.findAllByGameTemplateIdOrderByPriorityAsc(requireNotNull(node.gameTemplateId))
                     .filter { it.sourceNodeId == node.id }
                 val items = menuItemsForNode(session, node)
@@ -1709,7 +1927,7 @@ class SessionStateMachineService(
                         val expected = condition["selection"]?.toString()
                         expected == selected?.label ||
                             expected == selected?.value ||
-                            (expected == "{teams}" && selected?.label != "Bank")
+                            ((expected == "{teams}" || expected == "\$teams") && selected?.label != "Bank")
                     }?.targetNodeId
                         ?: edges.firstOrNull { readMap(it.conditionConfigJson).isEmpty() }?.targetNodeId
                         ?: edges.getOrNull(items.indexOf(selected).coerceAtLeast(0))?.targetNodeId
@@ -1778,6 +1996,11 @@ class SessionStateMachineService(
 
                 "CALCULATE" -> {
                     runtimeContext = runtimeContext + calculateFlowValue(session, node, readMap(node.configJson), runtimeContext)
+                    nodeId = nextNodeByEvent(node, "NEXT")
+                }
+
+                "RANDOMIZER" -> {
+                    runtimeContext = runtimeContext + randomizeFlowValue(session, readMap(node.configJson))
                     nodeId = nextNodeByEvent(node, "NEXT")
                 }
 
@@ -1934,8 +2157,8 @@ class SessionStateMachineService(
         val placeholders = context.mapValues { (key, value) -> displayValueForVariable(session, key, value) }.toMutableMap()
         val template = readMap(node.configJson)["template"]?.toString()
         template
-            ?.let { Regex("""\{([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?)\}""").findAll(it) }
-            ?.map { it.groupValues[1] }
+            ?.let { builderVariableRegex().findAll(it) }
+            ?.map { builderVariableKey(it) }
             ?.forEach { key ->
                 displayValueForExpression(session, key, context)?.let { placeholders[key] = it }
             }
@@ -1982,11 +2205,17 @@ class SessionStateMachineService(
 
     private fun renderBuilderTemplate(session: NfcGameSession, template: String?, context: Map<String, String>): String? {
         val raw = template?.takeIf { it.isNotBlank() } ?: return template
-        return Regex("""\{([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?)\}""").replace(raw) { match ->
-            val key = match.groupValues[1]
+        return builderVariableRegex().replace(raw) { match ->
+            val key = builderVariableKey(match)
             builderTemplateValue(session, key, context) ?: match.value
         }
     }
+
+    private fun builderVariableRegex(): Regex =
+        Regex("""\{([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?)\}|\$([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)?)""")
+
+    private fun builderVariableKey(match: MatchResult): String =
+        match.groupValues[1].ifBlank { match.groupValues[2] }
 
     private fun builderTemplateValue(session: NfcGameSession, key: String, context: Map<String, String>): String? =
         when (key) {
@@ -2013,7 +2242,7 @@ class SessionStateMachineService(
     private fun flowInputContext(session: NfcGameSession, node: NfcFlowNode, eventType: EventType, payload: Map<String, Any?>): Map<String, String> {
         if (!isConfirmEvent(eventType) && eventType != EventType.TOUCH_MENU_SELECT && eventType != EventType.TOUCH_NUMBER_SET) return emptyMap()
         return when (node.type) {
-            "MENU" -> {
+            "MENU", "WAIT_PLAYER_CARD", "WAIT_GAME_CARD" -> {
                 val items = menuItemsForNode(session, node)
                 val selected = if (eventType == EventType.TOUCH_MENU_SELECT) {
                     selectedMenuItemFromTouchPayload(items, payload)
@@ -2025,10 +2254,14 @@ class SessionStateMachineService(
                     selected?.let {
                         if (isDynamicAccountMenu(node)) {
                             put("target", it.value)
-                            storeAs?.let { key -> put(key, it.value) }
+                            if (node.type == "MENU") {
+                                storeAs?.let { key -> put(key, it.value) }
+                            }
                         } else {
                             put("selection", it.label)
-                            storeAs?.let { key -> put(key, it.label) }
+                            if (node.type == "MENU") {
+                                storeAs?.let { key -> put(key, it.label) }
+                            }
                         }
                     }
                 }
@@ -2050,14 +2283,23 @@ class SessionStateMachineService(
         if (config["optionsSource"]?.toString() == "playersAndBank") {
             return bankTargets(session).map { MenuItem(it.label, it.accountId.toString()) }
         }
-        val bank = accountRepository.findAllBySessionId(requireNotNull(session.id))
-            .firstOrNull { it.ownerType == OwnerType.BANK }
-        return stringList(config["options"]).flatMap { option ->
+        val configuredOptions = stringList(config["options"])
+        if (configuredOptions.isEmpty()) return emptyList()
+        val needsBank = configuredOptions.any { option ->
+            option.equals("{bank}", ignoreCase = true) || option.equals("\$bank", ignoreCase = true) || option.equals("Bank", ignoreCase = true)
+        }
+        val bank = if (needsBank) {
+            accountRepository.findAllBySessionId(requireNotNull(session.id))
+                .firstOrNull { it.ownerType == OwnerType.BANK }
+        } else {
+            null
+        }
+        return configuredOptions.flatMap { option ->
             when {
-                option.equals("{teams}", ignoreCase = true) -> bankTargets(session)
+                option.equals("{teams}", ignoreCase = true) || option.equals("\$teams", ignoreCase = true) -> bankTargets(session)
                     .filter { it.label != "Bank" }
                     .map { MenuItem(it.label, it.accountId.toString()) }
-                option.equals("{bank}", ignoreCase = true) || option.equals("Bank", ignoreCase = true) ->
+                option.equals("{bank}", ignoreCase = true) || option.equals("\$bank", ignoreCase = true) || option.equals("Bank", ignoreCase = true) ->
                     listOfNotNull(bank?.id?.let { MenuItem("Bank", it.toString()) })
                 else -> listOf(MenuItem(option, option))
             }
@@ -2069,9 +2311,19 @@ class SessionStateMachineService(
         return config["optionsSource"]?.toString() == "playersAndBank" ||
             stringList(config["options"]).any {
                 it.equals("{teams}", ignoreCase = true) ||
+                    it.equals("\$teams", ignoreCase = true) ||
                     it.equals("{bank}", ignoreCase = true) ||
+                    it.equals("\$bank", ignoreCase = true) ||
                     it.equals("Bank", ignoreCase = true)
             }
+    }
+
+    private fun isMenuInputNode(node: NfcFlowNode): Boolean =
+        node.type == "MENU" || (node.type in setOf("WAIT_PLAYER_CARD", "WAIT_GAME_CARD") && menuItemsForNodePlaceholderSafe(node))
+
+    private fun menuItemsForNodePlaceholderSafe(node: NfcFlowNode): Boolean {
+        val config = readMap(node.configJson)
+        return config["optionsSource"]?.toString() == "playersAndBank" || stringList(config["options"]).isNotEmpty()
     }
 
     private fun handleFlowSelectionInput(
@@ -2080,7 +2332,7 @@ class SessionStateMachineService(
         eventType: EventType,
         payload: Map<String, Any?>,
     ): Boolean {
-        if (node.type == "MENU") {
+        if (isMenuInputNode(node)) {
             if (eventType == EventType.TOUCH_MENU_SELECT) {
                 val items = menuItemsForNode(session, node)
                 val selected = selectedMenuItemFromTouchPayload(items, payload)
@@ -2544,6 +2796,17 @@ class SessionStateMachineService(
             .firstOrNull { it.sourceNodeId == node.id && it.eventType == eventType }
             ?.targetNodeId
 
+    private fun nextNodeForCardScan(node: NfcFlowNode, cardType: CardType): UUID? {
+        val specificEvent = when (cardType) {
+            CardType.PLAYER -> "PLAYER_CARD_SCANNED"
+            CardType.GAME -> "GAME_CARD_SCANNED"
+            CardType.UNKNOWN -> "CARD_SCANNED"
+        }
+        return nextNodeByEvent(node, specificEvent)
+            ?: nextNodeByEvent(node, "CARD_SCANNED")
+            ?: nextNodeByEvent(node, "NEXT")
+    }
+
     private fun nextNodeByEventPreferringType(node: NfcFlowNode, eventType: String, preferredType: String): UUID? {
         val edges = flowEdgeRepository.findAllByGameTemplateIdOrderByPriorityAsc(requireNotNull(node.gameTemplateId))
             .filter { it.sourceNodeId == node.id && it.eventType == eventType }
@@ -2597,6 +2860,7 @@ class SessionStateMachineService(
         private const val BANK_AMOUNT_MODE = "bank:amount"
         private const val BANK_PAY_SCAN_MODE = "bank:pay-scan"
         private const val MAX_RUNTIME_STEPS = 50
+        private const val MAX_DEVICE_UI_PREDICTIONS = 8
     }
 }
 
@@ -2683,6 +2947,13 @@ private class ArithmeticExpressionParser(
             val token = source.substring(start, index)
             index += 1
             return resolveToken(token)
+        }
+        if (peek() == '$') {
+            index += 1
+            val start = index
+            while (index < source.length && (source[index].isLetterOrDigit() || source[index] in setOf('_', '.'))) index += 1
+            if (index == start) return null
+            return resolveToken(source.substring(start, index))
         }
         val start = index
         if (peek()?.isDigit() == true || peek() == '.') {

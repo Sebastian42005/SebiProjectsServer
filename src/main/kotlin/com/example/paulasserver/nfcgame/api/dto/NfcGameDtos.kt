@@ -98,6 +98,17 @@ data class DeviceProvisioningResponse(
     val createdAt: Instant,
 )
 
+data class DeviceFirmwareManifestResponse(
+    val updateAvailable: Boolean,
+    val currentVersion: String,
+    val latestVersion: String,
+    val firmwareUrl: String? = null,
+    val size: Long? = null,
+    val md5: String? = null,
+    val force: Boolean = false,
+    val releaseNotes: String? = null,
+)
+
 data class GameTemplateRequest(
     @field:NotBlank val name: String,
     val description: String? = null,
@@ -120,6 +131,7 @@ data class GameTemplateRequest(
     val dashboardMetricSuffix: String? = null,
     val dashboardMetricSortDirection: String? = "DESC",
     val dashboardMetricDisplayType: String? = "RACE_BAR",
+    val dashboardMetricMaxSource: String? = null,
     val dashboardStatusSource: String? = "currentRound",
     val dashboardStatusLabel: String? = "Runde",
     val dashboardStatusSuffix: String? = null,
@@ -141,6 +153,7 @@ data class GameBasicRequest(
     val dashboardMetricSuffix: String? = null,
     val dashboardMetricSortDirection: String? = "DESC",
     val dashboardMetricDisplayType: String? = "RACE_BAR",
+    val dashboardMetricMaxSource: String? = null,
     val dashboardStatusSource: String? = "currentRound",
     val dashboardStatusLabel: String? = "Runde",
     val dashboardStatusSuffix: String? = null,
@@ -175,6 +188,7 @@ data class GameTemplateResponse(
     val dashboardMetricSuffix: String?,
     val dashboardMetricSortDirection: String?,
     val dashboardMetricDisplayType: String?,
+    val dashboardMetricMaxSource: String?,
     val dashboardStatusSource: String?,
     val dashboardStatusLabel: String?,
     val dashboardStatusSuffix: String?,
@@ -347,6 +361,7 @@ data class DeviceEventResponse(
     val errors: List<String> = emptyList(),
     val scannedCardType: CardType? = null,
     val scannedPlayerName: String? = null,
+    val uiHints: DeviceUiHints = DeviceUiHints(),
 )
 
 data class ScreenModel(
@@ -365,6 +380,20 @@ data class MenuItem(
     val value: String,
 )
 
+data class DeviceUiHints(
+    val predictions: List<DeviceUiPrediction> = emptyList(),
+    val allowedPlayerCardUids: List<String> = emptyList(),
+    val allowedGameCardUids: List<String> = emptyList(),
+)
+
+data class DeviceUiPrediction(
+    val eventType: EventType,
+    val match: Map<String, Any?> = emptyMap(),
+    val currentStateKey: String?,
+    val status: SessionStatus?,
+    val screen: ScreenModel,
+)
+
 data class SessionSummaryResponse(
     val id: UUID,
     val gameTemplateId: UUID,
@@ -377,6 +406,8 @@ data class SessionSummaryResponse(
     val dashboardMetricSuffix: String? = null,
     val dashboardMetricSortDirection: String = "DESC",
     val dashboardMetricDisplayType: String = "RACE_BAR",
+    val dashboardMetricMaxSource: String? = null,
+    val dashboardMetricMax: BigDecimal? = null,
     val dashboardStatusSource: String? = "currentRound",
     val dashboardStatusLabel: String = "Runde",
     val dashboardStatusSuffix: String? = null,
@@ -407,6 +438,10 @@ data class TeamResponse(
     val members: List<TeamMemberResponse>,
     val balance: BigDecimal? = null,
     val dashboardMetricValue: BigDecimal? = null,
+    val placementRank: Int? = null,
+    val roundGlobalPointsAwarded: Long = 0,
+    val placementGlobalPointsAwarded: Long = 0,
+    val globalPointsAwarded: Long = 0,
 )
 
 data class TeamMemberResponse(
