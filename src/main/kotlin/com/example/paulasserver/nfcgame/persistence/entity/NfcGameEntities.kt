@@ -163,6 +163,9 @@ class NfcGameTemplate : NfcUuidEntity() {
     @Column(nullable = false)
     var publicationStatus: GamePublicationStatus = GamePublicationStatus.DRAFT
 
+    @Column(columnDefinition = "text")
+    var blockedReason: String? = null
+
     @Column(nullable = false)
     var flowVersion: Int = 1
 
@@ -234,6 +237,46 @@ class NfcGameTemplate : NfcUuidEntity() {
 
     @PreUpdate
     fun touch() {
+        updatedAt = Instant.now()
+    }
+}
+
+@Entity
+@Table(
+    name = "nfc_game_rating",
+    indexes = [
+        Index(name = "idx_nfc_game_rating_game", columnList = "game_template_id"),
+        Index(name = "idx_nfc_game_rating_account", columnList = "account_id"),
+    ],
+    uniqueConstraints = [
+        UniqueConstraint(name = "uk_nfc_game_rating_game_account", columnNames = ["game_template_id", "account_id"]),
+    ],
+)
+class NfcGameRating : NfcUuidEntity() {
+    @Column(name = "game_template_id", nullable = false)
+    var gameTemplateId: UUID? = null
+
+    @Column(name = "account_id", nullable = false)
+    var accountId: Long? = null
+
+    @Column(nullable = false)
+    var rating: Int = 0
+
+    @Column(nullable = false, updatable = false)
+    var createdAt: Instant = Instant.now()
+
+    @Column(nullable = false)
+    var updatedAt: Instant = Instant.now()
+
+    @PrePersist
+    fun created() {
+        val now = Instant.now()
+        createdAt = now
+        updatedAt = now
+    }
+
+    @PreUpdate
+    fun ratingUpdated() {
         updatedAt = Instant.now()
     }
 }

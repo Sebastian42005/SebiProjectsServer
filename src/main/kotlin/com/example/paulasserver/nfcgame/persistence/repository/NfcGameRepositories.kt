@@ -15,6 +15,7 @@ import com.example.paulasserver.nfcgame.persistence.entity.NfcFlowState
 import com.example.paulasserver.nfcgame.persistence.entity.NfcFlowTransition
 import com.example.paulasserver.nfcgame.persistence.entity.NfcGameResult
 import com.example.paulasserver.nfcgame.persistence.entity.NfcGameSession
+import com.example.paulasserver.nfcgame.persistence.entity.NfcGameRating
 import com.example.paulasserver.nfcgame.persistence.entity.NfcGameTemplate
 import com.example.paulasserver.nfcgame.persistence.entity.NfcMoneyTransaction
 import com.example.paulasserver.nfcgame.persistence.entity.NfcPlayer
@@ -70,7 +71,16 @@ interface NfcGameTemplateRepository : JpaRepository<NfcGameTemplate, UUID> {
     fun findAllByAccountIdAndActiveTrueOrderByNameAsc(accountId: Long): List<NfcGameTemplate>
     fun findAllByPublicationStatusAndActiveTrueOrderByUpdatedAtDesc(status: GamePublicationStatus): List<NfcGameTemplate>
     fun findAllByPublicationStatusAndActiveTrueOrderByNameAsc(status: GamePublicationStatus): List<NfcGameTemplate>
+    fun findAllByPublicationStatusInAndActiveTrueOrderByUpdatedAtDesc(statuses: Collection<GamePublicationStatus>): List<NfcGameTemplate>
     fun deleteAllByAccountId(accountId: Long)
+}
+
+interface NfcGameRatingRepository : JpaRepository<NfcGameRating, UUID> {
+    fun findByGameTemplateIdAndAccountId(gameTemplateId: UUID, accountId: Long): NfcGameRating?
+    fun countByGameTemplateId(gameTemplateId: UUID): Long
+
+    @Query("select avg(r.rating) from NfcGameRating r where r.gameTemplateId = :gameTemplateId")
+    fun averageRatingByGameTemplateId(gameTemplateId: UUID): Double?
 }
 
 interface NfcFlowNodeRepository : JpaRepository<NfcFlowNode, UUID> {

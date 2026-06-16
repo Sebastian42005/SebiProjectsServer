@@ -112,7 +112,7 @@ class SessionStateMachineService(
     )
 
     @Transactional
-    fun handleCardScan(device: NfcDevice, cardUid: String): StateMachineResult {
+    fun handleCardScan(device: NfcDevice, cardUid: String, payload: Map<String, Any?> = emptyMap()): StateMachineResult {
         val normalizedUid = cardUid.trim().uppercase()
         val card = cardRepository.findByCardUid(normalizedUid)
             ?: return storeUnknownCard(normalizedUid, device.accountId)
@@ -126,7 +126,7 @@ class SessionStateMachineService(
 
         return when (card.cardType) {
             CardType.GAME -> handleGameCard(device, card)
-            CardType.PLAYER -> handlePlayerCard(card, device.accountId)
+            CardType.PLAYER -> handlePlayerCard(card, device.accountId, payload)
             CardType.UNKNOWN -> error("Karte nicht zugewiesen", "Bitte im Adminbereich als Spieler- oder Spielkarte zuweisen.")
         }
     }
@@ -329,7 +329,7 @@ class SessionStateMachineService(
         )
     }
 
-    private fun handlePlayerCard(card: NfcCard, accountId: Long?): StateMachineResult {
+    private fun handlePlayerCard(card: NfcCard, accountId: Long?, payload: Map<String, Any?> = emptyMap()): StateMachineResult {
         val session = findActiveSession(accountId)
             ?: return error("Keine aktive Session", "Zuerst eine Spielkarte scannen.")
         val playerId = card.playerId ?: return error("Spieler fehlt", "Diese Karte ist keinem Spieler zugeordnet.")
@@ -348,7 +348,7 @@ class SessionStateMachineService(
             )
             SessionStatus.BUILDING_TEAMS, SessionStatus.LOBBY -> {
                 if (session.currentStateKey == TEAM_SIZE_STATE) {
-                    confirmTeamSizeForFirstPlayerScan(session)
+                    confirmTeamSizeForFirstPlayerScan(session, payload)
                 }
                 addPlayerToTeam(session, playerId)
             }
@@ -600,7 +600,7 @@ class SessionStateMachineService(
                 }
 
                 "RANDOMIZER" -> {
-                    runtimeContext = runtimeContext + randomizeFlowValue(session, readMap(node.configJson))
+                    runtimeContext = runtimeContext + randomizeFlowValue(session, readMap(node.configJson), runtimeContext)
                     nodeId = nextNodeByEvent(node, "NEXT")
                 }
 
@@ -667,7 +667,6 @@ class SessionStateMachineService(
                 awardedPointsPerMember = points
             },
         )
-        statisticsService.recordRoundWin(winningTeamId, points.toLong())
         session.currentRoundNumber = nextRound
     }
 
@@ -744,6 +743,7 @@ class SessionStateMachineService(
         when (key) {
             "currentRound", "round", "currentRoundNumber" -> return effectiveCurrentRoundNumber(session).toBigDecimal()
             "roundLimit" -> return session.roundLimit?.toBigDecimal()
+            "teamCount" -> return completedTeamCount(session).toBigDecimal()
         }
         val parts = key.split('.', limit = 2)
         if (parts.size != 2) return key.toBigDecimalOrNull()
@@ -769,7 +769,7 @@ class SessionStateMachineService(
         return mapOf(normalizeBuilderToken(target) to value.stripTrailingZeros().toPlainString())
     }
 
-    private fun randomizeFlowValue(session: NfcGameSession, config: Map<String, Any?>): Map<String, String> {
+    private fun randomizeFlowValue(session: NfcGameSession, config: Map<String, Any?>, context: Map<String, String>): Map<String, String> {
         val target = config["storeAs"]?.toString()?.takeIf { it.isNotBlank() }
             ?: config["variableName"]?.toString()?.takeIf { it.isNotBlank() }
             ?: config["targetVariable"]?.toString()?.takeIf { it.isNotBlank() && it != "custom" }
@@ -789,7 +789,8 @@ class SessionStateMachineService(
 
             "TEXT", "STRING" -> {
                 val options = randomTextOptions(config)
-                mapOf(key to (options.randomOrNull() ?: ""))
+                val selectedOption = options.randomOrNull()
+                mapOf(key to (renderBuilderTemplate(session, selectedOption, context) ?: selectedOption ?: ""))
             }
 
             else -> {
@@ -1405,7 +1406,7 @@ class SessionStateMachineService(
                 },
             )
         }
-        statisticsService.recordGameFinished(allTeamIds, winningTeamId, placementPointAwards(session, winningTeamId, allTeamIds))
+        statisticsService.recordGameFinished(session, allTeamIds, winningTeamId, placementPointAwards(session, winningTeamId, allTeamIds))
     }
 
     private fun placementPointAwards(session: NfcGameSession, winningTeamId: UUID?, allTeamIds: Collection<UUID>): Map<UUID, Long> {
@@ -1513,12 +1514,19 @@ class SessionStateMachineService(
             val names = members.mapNotNull { member ->
                 member.playerId?.let { playerRepository.findById(it).orElse(null)?.name }
             }
+            val remainingSlots = (team.targetSize - members.size).coerceAtLeast(0)
             ScreenModel(
                 screenType = ScreenType.WAITING_FOR_SCAN,
                 title = "Spieler scannen",
                 subtitle = "${team.name}: ${members.size}/${team.targetSize}",
                 lines = names.take(3).map { "- $it" } + if (names.size > 3) listOf("+${names.size - 3} weitere") else emptyList(),
-                context = mapOf("sessionStatus" to session.status.name),
+                context = mapOf(
+                    "sessionStatus" to session.status.name,
+                    "teamName" to team.name,
+                    "teamPlayerCount" to members.size,
+                    "teamTargetSize" to team.targetSize,
+                    "teamRemainingSlots" to remainingSlots,
+                ),
             )
         } ?: ScreenModel(
             screenType = ScreenType.WAITING_FOR_SCAN,
@@ -1539,7 +1547,7 @@ class SessionStateMachineService(
         val previousLine = completedTeams.lastOrNull()?.let { team ->
             "Fertig: ${team.name} (${team.targetSize})"
         }
-        val startHint = if (hasCompletedTeam) listOf("Spielkarte scannen = mit bisherigen Teams starten") else emptyList()
+        val startHint = if (hasCompletedTeam) listOf("Button oder Spielkarte startet das Spiel") else emptyList()
         return ScreenModel(
             screenType = ScreenType.NUMBER_PICKER,
             title = "Teamgröße wählen",
@@ -1547,12 +1555,15 @@ class SessionStateMachineService(
             lines = listOfNotNull(
                 "Teams fertig: ${completedTeams.size}",
                 previousLine,
-                "Touch: Teamgroesse direkt setzen",
+                "Erste Spielerkarte setzt Teamgroesse",
             ) + startHint,
             numberValue = currentSize,
             context = mapOf(
                 "sessionStatus" to session.status.name,
                 "setupState" to TEAM_SIZE_STATE,
+                "teamName" to teamName,
+                "completedTeamCount" to completedTeams.size,
+                "canStartGame" to hasCompletedTeam,
                 "numberSmallStep" to 1,
                 "numberLargeStep" to 1,
             ),
@@ -2000,7 +2011,7 @@ class SessionStateMachineService(
                 }
 
                 "RANDOMIZER" -> {
-                    runtimeContext = runtimeContext + randomizeFlowValue(session, readMap(node.configJson))
+                    runtimeContext = runtimeContext + randomizeFlowValue(session, readMap(node.configJson), runtimeContext)
                     nodeId = nextNodeByEvent(node, "NEXT")
                 }
 
@@ -2224,6 +2235,10 @@ class SessionStateMachineService(
             "currency" -> bankStepConfig(session).currency
             else -> displayValueForExpression(session, key, context)
         }
+
+    private fun completedTeamCount(session: NfcGameSession): Int =
+        teamRepository.findAllBySessionIdOrderByTeamOrderAsc(requireNotNull(session.id))
+            .count { it.status != "CONFIGURING" }
 
     private fun playerName(playerId: String): String? =
         runCatching { UUID.fromString(playerId) }.getOrNull()
@@ -2671,6 +2686,22 @@ class SessionStateMachineService(
                 sessionRepository.save(session)
             }
             EventType.TOUCH_CONFIRM -> {
+                val wantsStartGame = payload["action"]?.toString() == "START_GAME" ||
+                    payload["startGame"] == true ||
+                    payload["startGame"]?.toString()?.toBooleanStrictOrNull() == true
+                if (wantsStartGame) {
+                    if (!hasCompletedTeam(session)) {
+                        return StateMachineResult(
+                            session = session,
+                            screen = buildScreen(session),
+                            effects = listOf("BEEP_ERROR"),
+                            errors = listOf("Zuerst ein Team voll scannen."),
+                        )
+                    }
+                    removeEmptySetupTeams(session, includeSizedSetupTeams = true)
+                    startSession(session)
+                    return StateMachineResult(session = session, screen = buildScreen(session), effects = listOf("BEEP_START"))
+                }
                 val rawValue = (payload["value"] as? Number)?.toInt() ?: payload["value"]?.toString()?.toIntOrNull()
                 if (rawValue != null) {
                     team.targetSize = rawValue.coerceIn(1, 20)
@@ -2687,9 +2718,13 @@ class SessionStateMachineService(
         return StateMachineResult(session = session, screen = buildScreen(session), effects = listOf("BEEP_INFO"))
     }
 
-    private fun confirmTeamSizeForFirstPlayerScan(session: NfcGameSession) {
+    private fun confirmTeamSizeForFirstPlayerScan(session: NfcGameSession, payload: Map<String, Any?> = emptyMap()) {
         val team = ensureSetupTeam(session)
-        team.targetSize = team.targetSize.coerceAtLeast(1)
+        val requestedSize = (payload["teamSize"] as? Number)?.toInt()
+            ?: payload["teamSize"]?.toString()?.toIntOrNull()
+            ?: (payload["value"] as? Number)?.toInt()
+            ?: payload["value"]?.toString()?.toIntOrNull()
+        team.targetSize = (requestedSize ?: team.targetSize).coerceIn(1, 20)
         team.status = "OPEN"
         teamRepository.save(team)
         session.status = SessionStatus.BUILDING_TEAMS

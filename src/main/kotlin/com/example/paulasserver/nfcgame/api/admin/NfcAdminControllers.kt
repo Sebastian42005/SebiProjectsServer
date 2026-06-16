@@ -3,6 +3,7 @@ package com.example.paulasserver.nfcgame.api.admin
 import com.example.paulasserver.dto.AuthMeResponse
 import com.example.paulasserver.dto.LoginRequest
 import com.example.paulasserver.nfcgame.api.dto.AdminAccountSummaryResponse
+import com.example.paulasserver.nfcgame.api.dto.BlockGameRequest
 import com.example.paulasserver.nfcgame.api.dto.CardAssignRequest
 import com.example.paulasserver.nfcgame.api.dto.CardResponse
 import com.example.paulasserver.nfcgame.api.dto.DeviceRequest
@@ -16,7 +17,6 @@ import com.example.paulasserver.nfcgame.api.dto.GameFlowResponse
 import com.example.paulasserver.nfcgame.api.dto.GameTemplateRequest
 import com.example.paulasserver.nfcgame.api.dto.GameTemplateResponse
 import com.example.paulasserver.nfcgame.api.dto.PlayerActiveRequest
-import com.example.paulasserver.nfcgame.api.dto.PlayerPointsRequest
 import com.example.paulasserver.nfcgame.api.dto.PlayerRequest
 import com.example.paulasserver.nfcgame.api.dto.PlayerResponse
 import com.example.paulasserver.nfcgame.application.admin.NfcAccountManagementService
@@ -110,10 +110,6 @@ class NfcAdminController(
     fun updatePlayerActive(@PathVariable id: UUID, @RequestBody request: PlayerActiveRequest): PlayerResponse =
         adminService.updatePlayerActive(id, request.active)
 
-    @PatchMapping("/players/{id}/points")
-    fun updatePlayerPoints(@PathVariable id: UUID, @RequestBody request: PlayerPointsRequest): PlayerResponse =
-        adminService.updatePlayerPoints(id, request.totalPoints)
-
     @PostMapping("/players/{id}/image")
     fun uploadPlayerImage(
         @PathVariable id: UUID,
@@ -137,6 +133,9 @@ class NfcAdminController(
 
     @PostMapping("/cards/assign")
     fun assignCard(@Valid @RequestBody request: CardAssignRequest): CardResponse = adminService.assignCard(request)
+
+    @DeleteMapping("/cards/{id}")
+    fun deleteCard(@PathVariable id: UUID) = adminService.deleteCard(id)
 
     @GetMapping("/devices")
     fun listDevices(): List<DeviceResponse> = adminService.listDevices()
@@ -210,6 +209,13 @@ class NfcAdminController(
 
     @PostMapping("/games/{id}/reject-publication")
     fun rejectPublication(@PathVariable id: UUID): GameTemplateResponse = gameBuilderService.rejectPublication(id)
+
+    @PostMapping("/games/{id}/block-publication")
+    fun blockPublication(@PathVariable id: UUID, @Valid @RequestBody request: BlockGameRequest): GameTemplateResponse =
+        gameBuilderService.blockPublication(id, request)
+
+    @PostMapping("/games/{id}/unblock-publication")
+    fun unblockPublication(@PathVariable id: UUID): GameTemplateResponse = gameBuilderService.unblockPublication(id)
 
     @GetMapping("/games/{id}/flow")
     fun getGameFlow(@PathVariable id: UUID): GameFlowResponse = gameBuilderService.getFlow(id)

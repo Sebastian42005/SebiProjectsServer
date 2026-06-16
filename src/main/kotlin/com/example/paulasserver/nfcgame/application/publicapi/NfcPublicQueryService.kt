@@ -1,6 +1,7 @@
 package com.example.paulasserver.nfcgame.application.publicapi
 
 import com.example.paulasserver.nfcgame.api.dto.GameResultResponse
+import com.example.paulasserver.nfcgame.api.dto.GameRatingRequest
 import com.example.paulasserver.nfcgame.api.dto.LeaderboardEntryResponse
 import com.example.paulasserver.nfcgame.api.dto.PlayerStatsResponse
 import com.example.paulasserver.nfcgame.api.dto.SessionSummaryResponse
@@ -15,12 +16,14 @@ import com.example.paulasserver.nfcgame.application.session.SessionStateMachineS
 import com.example.paulasserver.nfcgame.domain.OwnerType
 import com.example.paulasserver.nfcgame.domain.SessionStatus
 import com.example.paulasserver.nfcgame.persistence.entity.NfcGameSession
+import com.example.paulasserver.nfcgame.persistence.entity.NfcGameRating
 import com.example.paulasserver.nfcgame.persistence.entity.NfcGameTemplate
 import com.example.paulasserver.nfcgame.persistence.entity.NfcPlayerStatsProjection
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionRound
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionTeam
 import com.example.paulasserver.nfcgame.persistence.entity.NfcSessionValue
 import com.example.paulasserver.nfcgame.persistence.repository.NfcGameResultRepository
+import com.example.paulasserver.nfcgame.persistence.repository.NfcGameRatingRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcGameSessionRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcGameTemplateRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcFlowNodeRepository
@@ -39,6 +42,7 @@ import org.springframework.http.MediaType
 import org.springframework.http.ResponseEntity
 import org.springframework.messaging.simp.SimpMessagingTemplate
 import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Transactional
 import org.springframework.web.server.ResponseStatusException
 import java.math.BigDecimal
 import java.util.UUID
@@ -53,6 +57,7 @@ class NfcPublicQueryService(
     private val flowNodeRepository: NfcFlowNodeRepository,
     private val accountRepository: NfcSessionAccountRepository,
     private val resultRepository: NfcGameResultRepository,
+    private val ratingRepository: NfcGameRatingRepository,
     private val eventRepository: NfcSessionEventRepository,
     private val roundRepository: NfcSessionRoundRepository,
     private val valueRepository: NfcSessionValueRepository,
@@ -106,7 +111,14 @@ class NfcPublicQueryService(
     fun listPlayers(accountId: Long?) =
         accountId?.let(playerRepository::findAllByAccountIdAndActiveTrueOrderByNameAsc)
             .orEmpty()
-            .map(mapper::toPlayerResponse)
+            .map { player ->
+                mapper.toPlayerResponse(
+                    player,
+                    totalPoints = player.id
+                        ?.let { statsRepository.findById(it).orElse(null)?.totalPoints }
+                        ?: 0,
+                )
+            }
 
     fun listGames(accountId: Long?) =
         accountId?.let(gameTemplateRepository::findAllByAccountIdAndActiveTrueOrderByNameAsc)
@@ -114,11 +126,18 @@ class NfcPublicQueryService(
             .map(mapper::toGameTemplateResponse)
 
     fun listPublicGames() =
+        listPublicGames(null)
+
+    fun listPublicGames(accountId: Long?) =
         gameTemplateRepository.findAllByPublicationStatusAndActiveTrueOrderByNameAsc(GamePublicationStatus.PUBLISHED)
-            .map { mapper.toGameTemplateResponse(it, ownedByCurrentAccount = false) }
+            .map { toPublicGameResponse(it, accountId) }
 
     fun addPublicGameToLibrary(gameId: UUID) =
         gameBuilderService.copyPublicGameToCurrentAccount(gameId)
+
+    @Transactional
+    fun ratePublicGame(gameId: UUID, request: GameRatingRequest, accountId: Long?) =
+        toPublicGameResponse(saveRating(gameId, request, accountId), accountId)
 
     fun getPlayerImage(playerId: UUID, accountId: Long?): ResponseEntity<ByteArray> {
         val player = playerRepository.findById(playerId).orElseThrow { notFound("Player not found") }
@@ -207,6 +226,34 @@ class NfcPublicQueryService(
 
     private fun gameImageUrl(template: com.example.paulasserver.nfcgame.persistence.entity.NfcGameTemplate?): String? =
         template?.imageContentType?.let { "/api/public/games/${template.id}/image" } ?: template?.imageUrl
+
+    private fun saveRating(gameId: UUID, request: GameRatingRequest, accountId: Long?): NfcGameTemplate {
+        val userAccountId = accountId ?: throw ResponseStatusException(HttpStatus.UNAUTHORIZED, "Login required")
+        val game = gameTemplateRepository.findById(gameId).orElseThrow { notFound("Game not found") }
+        if (!game.active || game.publicationStatus != GamePublicationStatus.PUBLISHED) {
+            throw notFound("Game not found")
+        }
+        if (game.accountId == userAccountId) {
+            throw ResponseStatusException(HttpStatus.BAD_REQUEST, "Own games cannot be rated")
+        }
+        val rating = ratingRepository.findByGameTemplateIdAndAccountId(gameId, userAccountId)
+            ?: NfcGameRating().apply {
+                gameTemplateId = gameId
+                this.accountId = userAccountId
+            }
+        rating.rating = request.rating.coerceIn(1, 5)
+        ratingRepository.save(rating)
+        return game
+    }
+
+    private fun toPublicGameResponse(game: NfcGameTemplate, accountId: Long?) =
+        mapper.toGameTemplateResponse(
+            game,
+            ownedByCurrentAccount = accountId != null && game.accountId == accountId,
+            ratingAverage = requireNotNull(game.id).let { ratingRepository.averageRatingByGameTemplateId(it) } ?: 0.0,
+            ratingCount = requireNotNull(game.id).let { ratingRepository.countByGameTemplateId(it) },
+            myRating = accountId?.let { ratingRepository.findByGameTemplateIdAndAccountId(requireNotNull(game.id), it)?.rating },
+        )
 
     fun toSessionSummary(session: NfcGameSession): SessionSummaryResponse {
         val sessionId = requireNotNull(session.id)

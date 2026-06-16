@@ -367,7 +367,7 @@ class SessionStateMachineServiceTest {
             this.gameTemplateId = gameTemplateId
             type = "LOG_EVENT"
             title = "Timeline schreiben"
-            configJson = """{"template":"{scannedPlayer.name} ist Platz {scannedPlayer.placement} / {scannedPlayer.rank} / {scannedPlayer.platzierung}."}"""
+            configJson = """{"template":"{scannedPlayer.name} ist Platz {scannedPlayer.placement} / {scannedPlayer.rank} / {scannedPlayer.platzierung} von {teamCount} Teams."}"""
             sortOrder = 2
         }
         val scanToLog = NfcFlowEdge().apply {
@@ -394,7 +394,7 @@ class SessionStateMachineServiceTest {
 
         val result = service.handleCardScan(device, "teddy-card")
 
-        assertEquals("Teddy ist Platz 2 / 2 / 2.", result.timelineMessage)
+        assertEquals("Teddy ist Platz 2 / 2 / 2 von 2 Teams.", result.timelineMessage)
     }
 
     @Test

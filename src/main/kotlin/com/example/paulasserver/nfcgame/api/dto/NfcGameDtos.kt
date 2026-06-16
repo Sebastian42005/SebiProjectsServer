@@ -9,6 +9,8 @@ import com.example.paulasserver.nfcgame.domain.ScreenType
 import com.example.paulasserver.nfcgame.domain.SessionStatus
 import com.example.paulasserver.nfcgame.domain.WinRuleType
 import jakarta.validation.constraints.NotBlank
+import jakarta.validation.constraints.Max
+import jakarta.validation.constraints.Min
 import jakarta.validation.constraints.Positive
 import java.math.BigDecimal
 import java.time.Instant
@@ -56,10 +58,6 @@ data class PlayerRequest(
 
 data class PlayerActiveRequest(
     val active: Boolean,
-)
-
-data class PlayerPointsRequest(
-    val totalPoints: Long,
 )
 
 data class PlayerResponse(
@@ -168,6 +166,10 @@ data class GameTemplateResponse(
     val imageUrl: String?,
     val active: Boolean,
     val publicationStatus: GamePublicationStatus = GamePublicationStatus.DRAFT,
+    val blockedReason: String? = null,
+    val ratingAverage: Double = 0.0,
+    val ratingCount: Long = 0,
+    val myRating: Int? = null,
     val version: Int = 1,
     val startNodeId: UUID? = null,
     val cardUid: String? = null,
@@ -197,6 +199,14 @@ data class GameTemplateResponse(
     val ownedByCurrentAccount: Boolean = true,
     val createdAt: Instant,
     val updatedAt: Instant,
+)
+
+data class GameRatingRequest(
+    @field:Min(1) @field:Max(5) val rating: Int,
+)
+
+data class BlockGameRequest(
+    @field:NotBlank val reason: String,
 )
 
 data class FlowNodeRequest(

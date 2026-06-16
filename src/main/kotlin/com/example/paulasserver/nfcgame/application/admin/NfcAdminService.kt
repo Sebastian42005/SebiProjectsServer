@@ -23,7 +23,6 @@ import com.example.paulasserver.nfcgame.persistence.entity.NfcFlowState
 import com.example.paulasserver.nfcgame.persistence.entity.NfcFlowTransition
 import com.example.paulasserver.nfcgame.persistence.entity.NfcGameTemplate
 import com.example.paulasserver.nfcgame.persistence.entity.NfcPlayer
-import com.example.paulasserver.nfcgame.persistence.entity.NfcPlayerStatsProjection
 import com.example.paulasserver.nfcgame.persistence.repository.NfcCardRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcDeviceRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcFlowDefinitionRepository
@@ -94,17 +93,6 @@ class NfcAdminService(
         val player = ownedPlayer(id)
         player.active = active
         return toPlayerResponse(playerRepository.save(player))
-    }
-
-    fun updatePlayerPoints(id: UUID, totalPoints: Long): PlayerResponse {
-        val player = ownedPlayer(id)
-        val stats = statsRepository.findById(id).orElseGet {
-            NfcPlayerStatsProjection().apply { playerId = id }
-        }
-        stats.totalPoints = totalPoints
-        stats.updatedAt = java.time.Instant.now()
-        statsRepository.save(stats)
-        return mapper.toPlayerResponse(player, totalPoints = stats.totalPoints)
     }
 
     fun setPlayerImage(id: UUID, file: MultipartFile): PlayerResponse {
@@ -178,6 +166,10 @@ class NfcAdminService(
         card.playerId = if (request.cardType == CardType.PLAYER) request.playerId else null
         card.gameTemplateId = if (request.cardType == CardType.GAME) request.gameTemplateId else null
         return mapper.toCardResponse(cardRepository.save(card))
+    }
+
+    fun deleteCard(id: UUID) {
+        cardRepository.delete(ownedCard(id))
     }
 
     fun listDevices(): List<DeviceResponse> =
@@ -327,6 +319,11 @@ class NfcAdminService(
             if (it.accountId != currentAccountId()) throw notFound("Device not found")
         }
 
+    private fun ownedCard(id: UUID): NfcCard =
+        cardRepository.findById(id).orElseThrow { notFound("Card not found") }.also {
+            if (it.accountId != currentAccountId()) throw notFound("Card not found")
+        }
+
     fun ownedGameTemplate(id: UUID): NfcGameTemplate =
         gameTemplateRepository.findById(id).orElseThrow { notFound("Game template not found") }.also {
             if (it.accountId != currentAccountId() && !canManagePublicationReviews()) throw notFound("Game template not found")
@@ -370,7 +367,7 @@ class NfcAdminService(
         globalWinnerPoints = request.globalWinnerPoints.coerceAtLeast(0)
         globalSecondPlacePoints = request.globalSecondPlacePoints?.coerceAtLeast(0)
         globalThirdPlacePoints = request.globalThirdPlacePoints?.coerceAtLeast(0)
-        dashboardMetricSource = request.dashboardMetricSource?.takeIf { it.isNotBlank() } ?: "points"
+        dashboardMetricSource = request.dashboardMetricSource?.trim()?.takeIf { it.isNotBlank() }
         dashboardMetricLabel = request.dashboardMetricLabel?.trim() ?: "Punkte"
         dashboardMetricSuffix = request.dashboardMetricSuffix?.takeIf { it.isNotBlank() }
         dashboardMetricSortDirection = request.dashboardMetricSortDirection?.takeIf { it.equals("ASC", true) || it.equals("DESC", true) }?.uppercase() ?: "DESC"
@@ -379,7 +376,7 @@ class NfcAdminService(
         dashboardStatusSource = request.dashboardStatusSource?.trim()?.takeIf { it.isNotBlank() }
         dashboardStatusLabel = request.dashboardStatusLabel?.trim() ?: "Runde"
         dashboardStatusSuffix = request.dashboardStatusSuffix?.takeIf { it.isNotBlank() }
-        dashboardStatusMaxSource = request.dashboardStatusMaxSource?.takeIf { it.isNotBlank() }
+        dashboardStatusMaxSource = request.dashboardStatusMaxSource?.trim()?.takeIf { it.isNotBlank() }
         dashboardStatusDisplayType = request.dashboardStatusDisplayType?.takeIf { it.isNotBlank() }?.uppercase() ?: "PROGRESS_BAR"
     }
 

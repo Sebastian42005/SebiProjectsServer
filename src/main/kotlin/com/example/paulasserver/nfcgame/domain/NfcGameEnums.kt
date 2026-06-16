@@ -77,4 +77,5 @@ enum class GamePublicationStatus {
     PENDING_REVIEW,
     PUBLISHED,
     REJECTED,
+    BLOCKED,
 }

@@ -1,6 +1,5 @@
 package com.example.paulasserver.service
 
-import com.example.paulasserver.dto.ShoppingListItemResponseDto
 import com.example.paulasserver.entities.ShoppingListItem
 import com.example.paulasserver.repositories.ShoppingListRepository
 import org.springframework.stereotype.Service

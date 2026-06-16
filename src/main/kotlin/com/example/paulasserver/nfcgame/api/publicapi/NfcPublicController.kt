@@ -1,11 +1,14 @@
 package com.example.paulasserver.nfcgame.api.publicapi
 
 import com.example.paulasserver.nfcgame.application.publicapi.NfcPublicQueryService
+import com.example.paulasserver.nfcgame.api.dto.GameRatingRequest
 import com.example.paulasserver.security.AuthenticatedUser
+import jakarta.validation.Valid
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.GetMapping
 import org.springframework.web.bind.annotation.PathVariable
 import org.springframework.web.bind.annotation.PostMapping
+import org.springframework.web.bind.annotation.RequestBody
 import org.springframework.web.bind.annotation.RequestAttribute
 import org.springframework.web.bind.annotation.RequestMapping
 import org.springframework.web.bind.annotation.RestController
@@ -63,11 +66,19 @@ class NfcPublicController(
         publicQueryService.listGames(user?.id)
 
     @GetMapping("/games/public")
-    fun publicGames() = publicQueryService.listPublicGames()
+    fun publicGames(@RequestAttribute(name = "authenticatedUser", required = false) user: AuthenticatedUser?) =
+        publicQueryService.listPublicGames(user?.id)
 
     @PostMapping("/games/{gameId}/library")
     fun addPublicGameToLibrary(@PathVariable gameId: UUID) =
         publicQueryService.addPublicGameToLibrary(gameId)
+
+    @PostMapping("/games/{gameId}/rating")
+    fun ratePublicGame(
+        @PathVariable gameId: UUID,
+        @Valid @RequestBody request: GameRatingRequest,
+        @RequestAttribute(name = "authenticatedUser", required = false) user: AuthenticatedUser?,
+    ) = publicQueryService.ratePublicGame(gameId, request, user?.id)
 
     @GetMapping("/games/{gameId}/image")
     fun gameImage(

@@ -31,24 +31,22 @@ class NfcStatisticsService(
     private val valueRepository: NfcSessionValueRepository,
     private val accountRepository: NfcSessionAccountRepository,
 ) {
-    fun recordRoundWin(winningTeamId: UUID, pointsPerMember: Long = 1) {
-        memberRepository.findAllBySessionTeamId(winningTeamId).forEach { member ->
-            val playerId = requireNotNull(member.playerId)
-            val stats = statsRepository.findById(playerId).orElseGet {
-                NfcPlayerStatsProjection().apply { this.playerId = playerId }
-            }
-            stats.roundsWon += 1
-            stats.totalPoints += pointsPerMember
-            stats.updatedAt = Instant.now()
-            statsRepository.save(stats)
-        }
-    }
-
     fun recordGameFinished(
+        session: NfcGameSession,
         allTeamIds: Collection<UUID>,
         winningTeamId: UUID?,
         placementPointsByTeam: Map<UUID, Long> = emptyMap(),
     ) {
+        val roundAwards = roundRepository.findAllBySessionIdOrderByRoundNumberAsc(requireNotNull(session.id))
+            .mapNotNull { round -> round.winningTeamId?.let { teamId -> teamId to round.awardedPointsPerMember.toLong() } }
+        val roundPointsByTeam = roundAwards
+            .groupingBy { it.first }
+            .fold(0L) { sum, entry -> sum + entry.second }
+        val roundWinsByTeam = roundAwards
+            .filter { it.second != 0L }
+            .groupingBy { it.first }
+            .eachCount()
+
         allTeamIds.forEach { teamId ->
             memberRepository.findAllBySessionTeamId(teamId).forEach { member ->
                 val playerId = requireNotNull(member.playerId)
@@ -59,6 +57,9 @@ class NfcStatisticsService(
                 if (teamId == winningTeamId) {
                     stats.gamesWon += 1
                 }
+                val roundPoints = roundPointsByTeam[teamId] ?: 0
+                stats.roundsWon += (roundWinsByTeam[teamId] ?: 0).toLong()
+                stats.totalPoints += roundPoints
                 stats.totalPoints += placementPointsByTeam[teamId] ?: 0
                 stats.winRate = if (stats.gamesPlayed == 0L) 0.0 else stats.gamesWon.toDouble() / stats.gamesPlayed
                 stats.updatedAt = Instant.now()
@@ -87,17 +88,17 @@ class NfcStatisticsService(
             val teams = teamRepository.findAllBySessionIdOrderByTeamOrderAsc(sessionId)
             val teamIds = teams.mapNotNull { it.id }
 
-            roundRepository.findAllBySessionIdOrderByRoundNumberAsc(sessionId).forEach { round ->
-                val winningTeamId = round.winningTeamId ?: return@forEach
-                memberRepository.findAllBySessionTeamId(winningTeamId).forEach { member ->
-                    val stats = statsByPlayerId.getOrCreate(requireNotNull(member.playerId))
-                    stats.roundsWon += 1
-                    stats.totalPoints += round.awardedPointsPerMember.toLong()
-                    stats.updatedAt = Instant.now()
-                }
-            }
-
             if (session.status == SessionStatus.FINISHED) {
+                roundRepository.findAllBySessionIdOrderByRoundNumberAsc(sessionId).forEach { round ->
+                    val winningTeamId = round.winningTeamId ?: return@forEach
+                    memberRepository.findAllBySessionTeamId(winningTeamId).forEach { member ->
+                        val stats = statsByPlayerId.getOrCreate(requireNotNull(member.playerId))
+                        stats.roundsWon += 1
+                        stats.totalPoints += round.awardedPointsPerMember.toLong()
+                        stats.updatedAt = Instant.now()
+                    }
+                }
+
                 val winningTeamId = resultRepository.findBySessionId(sessionId)?.winningTeamId
                 val placementPointsByTeam = placementPointAwards(session, teamIds, winningTeamId)
                 teamIds.forEach { teamId ->

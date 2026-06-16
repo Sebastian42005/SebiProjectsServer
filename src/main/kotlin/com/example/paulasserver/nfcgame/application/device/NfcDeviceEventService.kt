@@ -76,7 +76,7 @@ class NfcDeviceEventService(
             -> {
                 val cardUid = request.cardUid?.takeIf { it.isNotBlank() }
                     ?: throw ResponseStatusException(HttpStatus.BAD_REQUEST, "cardUid is required for card scan events")
-                stateMachineService.handleCardScan(device, cardUid)
+                stateMachineService.handleCardScan(device, cardUid, request.payload)
             }
 
             EventType.JOYSTICK_LONG_PRESS,

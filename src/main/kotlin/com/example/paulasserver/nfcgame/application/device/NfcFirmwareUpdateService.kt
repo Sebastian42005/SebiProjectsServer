@@ -18,9 +18,9 @@ import java.util.HexFormat
 @Validated
 @ConfigurationProperties(prefix = "app.nfc-game.ota")
 data class NfcOtaProperties(
-    val enabled: Boolean = false,
+    val enabled: Boolean = true,
     @field:NotBlank
-    val version: String = "1.0.0",
+    val version: String = "1.0.1",
     @field:NotBlank
     val storagePath: String = "firmware/nfc-game-device",
     @field:NotBlank

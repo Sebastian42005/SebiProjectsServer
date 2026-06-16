@@ -116,6 +116,11 @@ class NfcGamePointsIntegrationTest @Autowired constructor(
         assertEquals(11, leaderboard.first { it.playerId == winnerTwo.id }.totalPoints)
         assertEquals(7, leaderboard.first { it.playerId == second.id }.totalPoints)
         assertEquals(3, leaderboard.first { it.playerId == third.id }.totalPoints)
+        val players = publicQueryService.listPlayers(accountId)
+        assertEquals(11, players.first { it.id == winnerOne.id }.totalPoints)
+        assertEquals(11, players.first { it.id == winnerTwo.id }.totalPoints)
+        assertEquals(7, players.first { it.id == second.id }.totalPoints)
+        assertEquals(3, players.first { it.id == third.id }.totalPoints)
 
         val board = publicQueryService.getSession(requireNotNull(session.id), accountId)
         assertEquals(SessionStatus.FINISHED, board.status)
@@ -137,7 +142,7 @@ class NfcGamePointsIntegrationTest @Autowired constructor(
     }
 
     @Test
-    fun `ADD_GLOBAL_POINTS awards player stats through a real builder scan without creating session value points`() {
+    fun `ADD_GLOBAL_POINTS stays pending for career stats until the session is finished`() {
         val accountId = nextAccountId()
         val game = game(accountId, "Builder Globalpunkte Spiel").apply {
             globalWinnerPoints = 0
@@ -171,7 +176,7 @@ class NfcGamePointsIntegrationTest @Autowired constructor(
         assertEquals(1, rounds.size)
         assertEquals(requireNotNull(winnerTeam.id), rounds.single().winningTeamId)
         assertEquals(4, rounds.single().awardedPointsPerMember)
-        assertPlayerStats(requireNotNull(winner.id), gamesPlayed = 0, gamesWon = 0, roundsWon = 1, totalPoints = 4)
+        assertPlayerStatsMissing(requireNotNull(winner.id))
         assertTrue(statsRepository.findById(requireNotNull(other.id)).isEmpty)
 
         val board = publicQueryService.getSession(requireNotNull(session.id), accountId)
@@ -181,11 +186,17 @@ class NfcGamePointsIntegrationTest @Autowired constructor(
         assertEquals(4, board.teams.first { it.id == winnerTeam.id }.globalPointsAwarded)
         assertEquals(0, board.teams.first { it.id == otherTeam.id }.globalPointsAwarded)
 
-        val leaderboardEntry = publicQueryService.getLeaderboard(accountId).single()
+        assertTrue(publicQueryService.getLeaderboard(accountId).isEmpty())
+
+        stateMachineService.finishSessionById(requireNotNull(session.id), "INTEGRATION_TEST_FINISH")
+
+        assertPlayerStats(requireNotNull(winner.id), gamesPlayed = 1, gamesWon = 1, roundsWon = 1, totalPoints = 4)
+        assertPlayerStats(requireNotNull(other.id), gamesPlayed = 1, gamesWon = 0, roundsWon = 0, totalPoints = 0)
+        val leaderboardEntry = publicQueryService.getLeaderboard(accountId).first()
         assertEquals(requireNotNull(winner.id), leaderboardEntry.playerId)
         assertEquals(4, leaderboardEntry.totalPoints)
         assertEquals(1, leaderboardEntry.roundsWon)
-        assertEquals(0, leaderboardEntry.gamesPlayed)
+        assertEquals(1, leaderboardEntry.gamesPlayed)
     }
 
     @Test

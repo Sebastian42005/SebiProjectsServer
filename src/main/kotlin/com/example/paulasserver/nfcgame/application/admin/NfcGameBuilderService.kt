@@ -1,6 +1,7 @@
 package com.example.paulasserver.nfcgame.application.admin
 
 import com.example.paulasserver.nfcgame.api.dto.CardAssignRequest
+import com.example.paulasserver.nfcgame.api.dto.BlockGameRequest
 import com.example.paulasserver.nfcgame.api.dto.FlowEdgeResponse
 import com.example.paulasserver.nfcgame.api.dto.FlowNodeResponse
 import com.example.paulasserver.nfcgame.api.dto.FlowValidationIssue
@@ -19,6 +20,7 @@ import com.example.paulasserver.nfcgame.persistence.entity.NfcGameTemplate
 import com.example.paulasserver.nfcgame.persistence.repository.NfcCardRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcFlowEdgeRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcFlowNodeRepository
+import com.example.paulasserver.nfcgame.persistence.repository.NfcGameRatingRepository
 import com.example.paulasserver.nfcgame.persistence.repository.NfcGameTemplateRepository
 import com.fasterxml.jackson.core.type.TypeReference
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -37,6 +39,7 @@ class NfcGameBuilderService(
     private val cardRepository: NfcCardRepository,
     private val nodeRepository: NfcFlowNodeRepository,
     private val edgeRepository: NfcFlowEdgeRepository,
+    private val ratingRepository: NfcGameRatingRepository,
     private val mapper: NfcGameMapper,
     private val adminService: NfcAdminService,
     private val objectMapper: ObjectMapper,
@@ -48,7 +51,9 @@ class NfcGameBuilderService(
 
     fun listPublicationRequests(): List<GameTemplateResponse> {
         adminService.requirePublicationManager()
-        return gameTemplateRepository.findAllByPublicationStatusAndActiveTrueOrderByUpdatedAtDesc(GamePublicationStatus.PENDING_REVIEW)
+        return gameTemplateRepository.findAllByPublicationStatusInAndActiveTrueOrderByUpdatedAtDesc(
+            listOf(GamePublicationStatus.PUBLISHED, GamePublicationStatus.BLOCKED),
+        )
             .map(::toGameResponse)
     }
 
@@ -138,6 +143,7 @@ class NfcGameBuilderService(
                 imageFileName = source.imageFileName
                 active = true
                 publicationStatus = GamePublicationStatus.DRAFT
+                blockedReason = null
                 flowVersion = 1
                 accountId = targetAccountId
                 allowTeams = source.allowTeams
@@ -278,8 +284,10 @@ class NfcGameBuilderService(
         if (!validation.valid) {
             throw ResponseStatusException(HttpStatus.BAD_REQUEST, validation.issues.joinToString("; ") { it.message })
         }
-        game.publicationStatus = GamePublicationStatus.PENDING_REVIEW
+        game.blockedReason = null
         game.active = true
+        game.publicationStatus = GamePublicationStatus.PUBLISHED
+        game.flowVersion += 1
         return toGameResponse(gameTemplateRepository.save(game))
     }
 
@@ -292,6 +300,7 @@ class NfcGameBuilderService(
             throw ResponseStatusException(HttpStatus.BAD_REQUEST, validation.issues.joinToString("; ") { it.message })
         }
         game.publicationStatus = GamePublicationStatus.PUBLISHED
+        game.blockedReason = null
         game.active = true
         game.flowVersion += 1
         return toGameResponse(gameTemplateRepository.save(game))
@@ -302,6 +311,30 @@ class NfcGameBuilderService(
         adminService.requirePublicationManager()
         val game = ownedGame(gameId)
         game.publicationStatus = GamePublicationStatus.REJECTED
+        return toGameResponse(gameTemplateRepository.save(game))
+    }
+
+    @Transactional
+    fun blockPublication(gameId: UUID, request: BlockGameRequest): GameTemplateResponse {
+        adminService.requirePublicationManager()
+        val game = gameTemplateRepository.findById(gameId).orElseThrow { notFound("Game not found") }
+        if (!game.active || game.publicationStatus !in setOf(GamePublicationStatus.PUBLISHED, GamePublicationStatus.BLOCKED)) {
+            throw notFound("Game not found")
+        }
+        game.publicationStatus = GamePublicationStatus.BLOCKED
+        game.blockedReason = request.reason.trim()
+        return toGameResponse(gameTemplateRepository.save(game))
+    }
+
+    @Transactional
+    fun unblockPublication(gameId: UUID): GameTemplateResponse {
+        adminService.requirePublicationManager()
+        val game = gameTemplateRepository.findById(gameId).orElseThrow { notFound("Game not found") }
+        if (!game.active || game.publicationStatus != GamePublicationStatus.BLOCKED) {
+            throw notFound("Game not found")
+        }
+        game.publicationStatus = GamePublicationStatus.PUBLISHED
+        game.blockedReason = null
         return toGameResponse(gameTemplateRepository.save(game))
     }
 
@@ -405,7 +438,7 @@ class NfcGameBuilderService(
         globalWinnerPoints = request.globalWinnerPoints.coerceAtLeast(0)
         globalSecondPlacePoints = request.globalSecondPlacePoints?.coerceAtLeast(0)
         globalThirdPlacePoints = request.globalThirdPlacePoints?.coerceAtLeast(0)
-        dashboardMetricSource = request.dashboardMetricSource?.takeIf { it.isNotBlank() } ?: "points"
+        dashboardMetricSource = request.dashboardMetricSource?.trim()?.takeIf { it.isNotBlank() }
         dashboardMetricLabel = request.dashboardMetricLabel?.trim() ?: "Punkte"
         dashboardMetricSuffix = request.dashboardMetricSuffix?.takeIf { it.isNotBlank() }
         dashboardMetricSortDirection = request.dashboardMetricSortDirection?.takeIf { it.equals("ASC", true) || it.equals("DESC", true) }?.uppercase() ?: "DESC"
@@ -414,7 +447,7 @@ class NfcGameBuilderService(
         dashboardStatusSource = request.dashboardStatusSource?.trim()?.takeIf { it.isNotBlank() }
         dashboardStatusLabel = request.dashboardStatusLabel?.trim() ?: "Runde"
         dashboardStatusSuffix = request.dashboardStatusSuffix?.takeIf { it.isNotBlank() }
-        dashboardStatusMaxSource = request.dashboardStatusMaxSource?.takeIf { it.isNotBlank() }
+        dashboardStatusMaxSource = request.dashboardStatusMaxSource?.trim()?.takeIf { it.isNotBlank() }
         dashboardStatusDisplayType = request.dashboardStatusDisplayType?.takeIf { it.isNotBlank() }?.uppercase() ?: "PROGRESS_BAR"
         resetPublicationStatusAfterEdit(this)
     }
@@ -422,6 +455,7 @@ class NfcGameBuilderService(
     private fun resetPublicationStatusAfterEdit(game: NfcGameTemplate) {
         if (!adminService.canManagePublicationReviews()) {
             game.publicationStatus = GamePublicationStatus.DRAFT
+            game.blockedReason = null
         }
     }
 
@@ -445,6 +479,8 @@ class NfcGameBuilderService(
             game,
             cardUid,
             ownedByCurrentAccount = game.accountId == adminService.currentAccountId(),
+            ratingAverage = game.id?.let { ratingRepository.averageRatingByGameTemplateId(it) } ?: 0.0,
+            ratingCount = game.id?.let { ratingRepository.countByGameTemplateId(it) } ?: 0,
         )
     }
 

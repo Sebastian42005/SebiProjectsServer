@@ -4,6 +4,7 @@ import com.example.paulasserver.nfcgame.api.dto.DeviceEventRequest
 import com.example.paulasserver.nfcgame.api.dto.DeviceEventResponse
 import com.example.paulasserver.nfcgame.api.dto.DeviceProvisioningResponse
 import com.example.paulasserver.nfcgame.api.dto.DeviceRequest
+import com.example.paulasserver.nfcgame.application.device.NfcAudioTestService
 import com.example.paulasserver.nfcgame.application.device.NfcDeviceEventService
 import com.example.paulasserver.nfcgame.application.device.NfcFirmwareUpdateService
 import jakarta.validation.Valid
@@ -27,7 +28,10 @@ import java.util.UUID
 class NfcDeviceController(
     private val deviceEventService: NfcDeviceEventService,
     private val firmwareUpdateService: NfcFirmwareUpdateService,
+    private val audioTestService: NfcAudioTestService,
 ) {
+    data class AudioAckRequest(val version: Long)
+
     @PostMapping("/events")
     fun handleEvent(@Valid @RequestBody request: DeviceEventRequest): DeviceEventResponse =
         deviceEventService.handleEvent(request)
@@ -73,6 +77,20 @@ class NfcDeviceController(
             .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"${firmware.fileName}\"")
             .body(firmware.resource)
     }
+
+    @GetMapping("/audio-test/latest/metadata")
+    fun audioTestMetadata(
+        @RequestHeader("X-Device-Id") deviceId: String,
+        @RequestHeader("X-Device-Key") deviceKey: String,
+        @RequestParam("knownVersion", required = false) knownVersion: Long?,
+    ) = audioTestService.deviceStatus(deviceId, deviceKey, knownVersion)
+
+    @PostMapping("/audio-test/latest/ack")
+    fun acknowledgeAudioTest(
+        @RequestHeader("X-Device-Id") deviceId: String,
+        @RequestHeader("X-Device-Key") deviceKey: String,
+        @RequestBody request: AudioAckRequest,
+    ) = audioTestService.acknowledge(deviceId, deviceKey, request.version)
 
     @GetMapping("/health")
     fun health() = deviceEventService.health()
