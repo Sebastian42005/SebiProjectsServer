@@ -1,8 +1,8 @@
 spring:
   datasource:
-    url: jdbc:postgresql://localhost:5432/pauladb
-    username: paula
-    password: paulaIstToll
+    url: jdbc:postgresql://localhost:5432/sebisprojectsdb
+    username: sebi
+    password: sebisProjectsPass
     driver-class-name: org.postgresql.Driver
 
   jpa:

@@ -4,9 +4,9 @@ services:
     ports:
       - '5432:5432'
     environment:
-      - 'POSTGRES_USER=paula'
-      - 'POSTGRES_DB=pauladb'
-      - 'POSTGRES_PASSWORD=paulaIstToll'
+      - 'POSTGRES_USER=sebi'
+      - 'POSTGRES_DB=sebisprojectsdb'
+      - 'POSTGRES_PASSWORD=sebisProjectsPass'
 
   libretranslate:
     image: libretranslate/libretranslate
