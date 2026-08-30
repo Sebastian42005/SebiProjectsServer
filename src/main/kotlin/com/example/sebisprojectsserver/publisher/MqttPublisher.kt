@@ -7,7 +7,9 @@ import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import org.springframework.stereotype.Service
 
 @Service
-class MqttPublisher {
+class MqttPublisher(
+    private val mqttProperties: MqttProperties,
+) {
 
     private lateinit var client: MqttClient
 
@@ -17,10 +19,14 @@ class MqttPublisher {
             return
         }
 
-        client = MqttClient("tcp://sebis-projects.at:1883", MqttClient.generateClientId(), MemoryPersistence())
+        client = MqttClient(mqttProperties.brokerUrl, MqttClient.generateClientId(), MemoryPersistence())
         val options = MqttConnectOptions().apply {
-            userName = "homeassistant"
-            password = "S4Bi2OO5".toCharArray()
+            if (mqttProperties.username.isNotBlank()) {
+                userName = mqttProperties.username
+            }
+            if (mqttProperties.password.isNotBlank()) {
+                password = mqttProperties.password.toCharArray()
+            }
             connectionTimeout = 3
             isAutomaticReconnect = true
         }

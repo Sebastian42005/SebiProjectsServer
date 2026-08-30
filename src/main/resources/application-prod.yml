@@ -1,8 +1,8 @@
 spring:
   datasource:
-    url: jdbc:postgresql://localhost:5432/sebisprojectsdb
-    username: sebi
-    password: sebisProjectsPass
+    url: jdbc:postgresql://localhost:5432/homedb
+    username: home
+    password: home_db_password_123
     driver-class-name: org.postgresql.Driver
 
   jpa:
@@ -18,4 +18,10 @@ spring:
       max-request-size: 200MB
 
 server:
-  port: 8080
+  port: 8082
+
+app:
+  mqtt:
+    broker-url: ${MQTT_BROKER_URL:tcp://home.sebi4.com:1883}
+    username: ${MQTT_USERNAME:homeassistant}
+    password: ${MQTT_PASSWORD:S4Bi2OO5}

@@ -193,7 +193,9 @@ class HabitService(
         instagramAccountRepository.save(account)
         redemptionRepository.save(redemption)
 
-        publishUnlock(request.minutes, unlockedUntil)
+        publishInstagramEvent {
+            publishUnlock(request.minutes, unlockedUntil)
+        }
         return accountDto(account)
     }
 
@@ -206,15 +208,19 @@ class HabitService(
             return
         }
 
-        mqttService.publish(
-            instagramTopic,
-            objectMapper.writeValueAsString(
-                mapOf(
-                    "action" to "LOCK",
-                    "unlockedUntil" to unlockUntil.toString(),
+        try {
+            mqttService.publish(
+                instagramTopic,
+                objectMapper.writeValueAsString(
+                    mapOf(
+                        "action" to "LOCK",
+                        "unlockedUntil" to unlockUntil.toString(),
+                    ),
                 ),
-            ),
-        )
+            )
+        } catch (_: Exception) {
+            return
+        }
 
         account.lockPublishedAt = Instant.now(clock)
         account.updatedAt = Instant.now(clock)
@@ -330,5 +336,17 @@ class HabitService(
                 ),
             ),
         )
+    }
+
+    private fun publishInstagramEvent(publish: () -> Unit) {
+        try {
+            publish()
+        } catch (error: Exception) {
+            throw ResponseStatusException(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                "Instagram konnte nicht freigeschaltet werden, weil MQTT nicht erreichbar oder nicht autorisiert ist.",
+                error,
+            )
+        }
     }
 }

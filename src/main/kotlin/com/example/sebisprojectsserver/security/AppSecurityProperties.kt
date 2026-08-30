@@ -15,6 +15,7 @@ data class AppSecurityProperties(
         "http://localhost:4300",
         "https://sebis-projects.at",
         "https://www.sebis-projects.at",
+        "https://home.sebi4.com",
     ),
     @field:Valid
     val jwt: JwtProperties = JwtProperties(),
